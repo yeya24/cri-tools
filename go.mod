@@ -25,7 +25,7 @@ require (
 	k8s.io/client-go v11.0.0+incompatible
 	k8s.io/cri-api v0.0.0
 	k8s.io/kubectl v0.0.0
-	k8s.io/kubernetes v0.0.0
+	k8s.io/kubernetes v0.21.4
 	sigs.k8s.io/yaml v1.2.0
 )
 
