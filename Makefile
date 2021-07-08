@@ -66,6 +66,7 @@ critest:
 $(CRITEST):
 	CGO_ENABLED=0 $(GO_TEST) -c -o $@ \
 		-ldflags '$(GO_LDFLAGS)' \
+		-trimpath \
 		-tags '$(BUILDTAGS)' \
 	     $(PROJECT)/cmd/critest
 
@@ -75,6 +76,7 @@ crictl:
 $(CRICTL):
 	CGO_ENABLED=0 $(GO_BUILD) -o $@ \
 		-ldflags '$(GO_LDFLAGS)' \
+		-trimpath \
 		-tags '$(BUILDTAGS)' \
 		$(PROJECT)/cmd/crictl
 
@@ -100,7 +102,7 @@ install.lint: $(GOLANGCI_LINT)
 
 $(GOLANGCI_LINT):
 	export \
-		VERSION=v1.32.2 \
+		VERSION=v1.40.1 \
 		URL=https://raw.githubusercontent.com/golangci/golangci-lint \
 		BINDIR=${BUILD_BIN_PATH} && \
 	curl -sfL $$URL/$$VERSION/install.sh | sh -s $$VERSION
