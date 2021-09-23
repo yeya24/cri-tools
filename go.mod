@@ -26,7 +26,7 @@ require (
 	k8s.io/cri-api v0.21.0
 	k8s.io/kubectl v0.21.0
 	k8s.io/kubernetes v0.21.4
-	sigs.k8s.io/yaml v1.2.0
+	sigs.k8s.io/yaml v1.3.0
 )
 
 replace (
