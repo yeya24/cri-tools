@@ -17,19 +17,12 @@ limitations under the License.
 package e2e
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 )
 
-// The actual test suite
+// The actual test suite.
 var _ = t.Describe("version", func() {
 	It("should succeed", func() {
-		// Given
-		endpoint, testDir, crio := t.StartCrio()
-
-		// When
-		t.CrictlExpectSuccessWithEndpoint(endpoint, "version", "RuntimeName:  cri-o")
-
-		// Then
-		t.StopCrio(testDir, crio)
+		t.CrictlExpectSuccess("version", "RuntimeName: ")
 	})
 })

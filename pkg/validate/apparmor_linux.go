@@ -18,20 +18,20 @@ package validate
 
 import (
 	"bytes"
-	"io/ioutil"
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	"github.com/pkg/errors"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/security/apparmor"
-
-	"github.com/golang/glog"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
 const (
@@ -53,79 +53,291 @@ profile cri-validate-apparmor-test-audit-write flags=(attach_disconnected) {
 `
 )
 
+// The AppArmor profile to the CRI via the deprecated apparmor_profile field
+// in favor of the newer structured apparmor field.
+// CRI provides the AppArmor profile via both fields to maintain backwards compatibility.
 var _ = framework.KubeDescribe("AppArmor", func() {
 	f := framework.NewDefaultCRIFramework()
 
-	var rc internalapi.RuntimeService
-	var ic internalapi.ImageManagerService
+	var (
+		rc                internalapi.RuntimeService
+		ic                internalapi.ImageManagerService
+		checkAppArmorOnce sync.Once
+		appArmorEnabled   bool
+	)
 
-	if apparmor.IsAppArmorEnabled() {
-		BeforeEach(func() {
-			rc = f.CRIClient.CRIRuntimeClient
-			ic = f.CRIClient.CRIImageClient
-			Expect(loadTestProfiles()).NotTo(HaveOccurred())
+	appArmorIsEnabled := func() bool {
+		checkAppArmorOnce.Do(func() {
+			buf, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
+			appArmorEnabled = err == nil && len(buf) > 1 && buf[0] == 'Y'
 		})
 
-		Context("runtime should support apparmor", func() {
-			var sandboxID string
-			var sandboxConfig *runtimeapi.PodSandboxConfig
-
-			BeforeEach(func() {
-				sandboxID, sandboxConfig = framework.CreatePodSandboxForContainer(rc)
-			})
-
-			AfterEach(func() {
-				By("stop PodSandbox")
-				rc.StopPodSandbox(sandboxID)
-				By("delete PodSandbox")
-				rc.RemovePodSandbox(sandboxID)
-			})
-
-			It("should fail with an unloaded profile", func() {
-				profile := apparmorProfileNamePrefix + "non-existent-profile"
-				containerID := createContainerWithAppArmor(rc, ic, sandboxID, sandboxConfig, profile, false)
-				Expect(containerID).To(BeEmpty())
-			})
-
-			It("should enforce a profile blocking writes", func() {
-				profile := apparmorProfileNamePrefix + "cri-validate-apparmor-test-deny-write"
-				containerID := createContainerWithAppArmor(rc, ic, sandboxID, sandboxConfig, profile, true)
-				checkContainerApparmor(rc, containerID, false)
-			})
-
-			It("should enforce a permissive profile", func() {
-				profile := apparmorProfileNamePrefix + "cri-validate-apparmor-test-audit-write"
-				containerID := createContainerWithAppArmor(rc, ic, sandboxID, sandboxConfig, profile, true)
-				checkContainerApparmor(rc, containerID, true)
-			})
-		})
+		return appArmorEnabled
 	}
+
+	BeforeEach(func(ctx SpecContext) {
+		if !appArmorIsEnabled() {
+			Skip("AppArmor is disabled on this host")
+		}
+
+		rc = f.CRIClient.CRIRuntimeClient
+		ic = f.CRIClient.CRIImageClient
+
+		Expect(loadTestProfiles(ctx)).NotTo(HaveOccurred())
+	})
+
+	Context("runtime should support deprecated apparmor_profile field", func() {
+		var (
+			sandboxID     string
+			sandboxConfig *runtimeapi.PodSandboxConfig
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			sandboxID, sandboxConfig = framework.CreatePodSandboxForContainer(ctx, rc)
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			framework.CleanupPodSandbox(ctx, rc, sandboxID)
+		})
+
+		It("should fail with an unloaded apparmor_profile", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				ApparmorProfile: apparmorProfileNamePrefix + "non-existent-profile",
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				false,
+			)
+			Expect(containerID).To(BeEmpty())
+		})
+
+		It("should enforce a apparmor_profile blocking writes", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				ApparmorProfile: apparmorProfileNamePrefix + "cri-validate-apparmor-test-deny-write",
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				true,
+			)
+			checkContainerApparmor(ctx, rc, containerID, false)
+		})
+
+		It("should enforce a permissive deprecated profile", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				ApparmorProfile: apparmorProfileNamePrefix + "cri-validate-apparmor-test-audit-write",
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				true,
+			)
+			checkContainerApparmor(ctx, rc, containerID, true)
+		})
+	})
+
+	Context("runtime should support apparmor field", func() {
+		var (
+			sandboxID     string
+			sandboxConfig *runtimeapi.PodSandboxConfig
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			sandboxID, sandboxConfig = framework.CreatePodSandboxForContainer(ctx, rc)
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			framework.CleanupPodSandbox(ctx, rc, sandboxID)
+		})
+
+		It("should fail with an unloaded apparmor_profile", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				Apparmor: &runtimeapi.SecurityProfile{
+					ProfileType:  runtimeapi.SecurityProfile_Localhost,
+					LocalhostRef: apparmorProfileNamePrefix + "non-existent-profile",
+				},
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				false,
+			)
+			Expect(containerID).To(BeEmpty())
+		})
+
+		It("should enforce a apparmor_profile blocking writes", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				Apparmor: &runtimeapi.SecurityProfile{
+					ProfileType:  runtimeapi.SecurityProfile_Localhost,
+					LocalhostRef: apparmorProfileNamePrefix + "cri-validate-apparmor-test-deny-write",
+				},
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				true,
+			)
+			checkContainerApparmor(ctx, rc, containerID, false)
+		})
+
+		It("should enforce a permissive deprecated profile", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				Apparmor: &runtimeapi.SecurityProfile{
+					ProfileType:  runtimeapi.SecurityProfile_Localhost,
+					LocalhostRef: apparmorProfileNamePrefix + "cri-validate-apparmor-test-audit-write",
+				},
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				true,
+			)
+			checkContainerApparmor(ctx, rc, containerID, true)
+		})
+	})
+
+	Context("runtime should prefer new apparmor field", func() {
+		var (
+			sandboxID     string
+			sandboxConfig *runtimeapi.PodSandboxConfig
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			sandboxID, sandboxConfig = framework.CreatePodSandboxForContainer(ctx, rc)
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			framework.CleanupPodSandbox(ctx, rc, sandboxID)
+		})
+
+		It("should fail with an unloaded apparmor_profile", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				ApparmorProfile: apparmorProfileNamePrefix + "non-existent-profile",
+				Apparmor: &runtimeapi.SecurityProfile{
+					ProfileType:  runtimeapi.SecurityProfile_Localhost,
+					LocalhostRef: apparmorProfileNamePrefix + "non-existent-profile",
+				},
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				false,
+			)
+			Expect(containerID).To(BeEmpty())
+		})
+
+		It("should enforce a apparmor_profile blocking writes", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				ApparmorProfile: apparmorProfileNamePrefix + "non-existent-profile",
+				Apparmor: &runtimeapi.SecurityProfile{
+					ProfileType:  runtimeapi.SecurityProfile_Localhost,
+					LocalhostRef: apparmorProfileNamePrefix + "cri-validate-apparmor-test-deny-write",
+				},
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				true,
+			)
+			checkContainerApparmor(ctx, rc, containerID, false)
+		})
+
+		It("should work with apparmor profile", func(ctx SpecContext) {
+			profile := &runtimeapi.LinuxContainerSecurityContext{
+				ApparmorProfile: apparmorProfileNamePrefix + "non-existent-profile",
+				Apparmor: &runtimeapi.SecurityProfile{
+					ProfileType:  runtimeapi.SecurityProfile_Localhost,
+					LocalhostRef: apparmorProfileNamePrefix + "cri-validate-apparmor-test-audit-write",
+				},
+			}
+			containerID := createContainerWithAppArmor(
+				ctx,
+				rc,
+				ic,
+				sandboxID,
+				sandboxConfig,
+				profile,
+				true,
+			)
+			checkContainerApparmor(ctx, rc, containerID, true)
+		})
+	})
 })
 
-func createContainerWithAppArmor(rc internalapi.RuntimeService, ic internalapi.ImageManagerService, sandboxID string, sandboxConfig *runtimeapi.PodSandboxConfig, profile string, shouldSucceed bool) string {
+func createContainerWithAppArmor(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	ic internalapi.ImageManagerService,
+	sandboxID string,
+	sandboxConfig *runtimeapi.PodSandboxConfig,
+	profile *runtimeapi.LinuxContainerSecurityContext,
+	shouldSucceed bool,
+) string {
 	By("create a container with apparmor")
+
 	containerName := "apparmor-test-" + framework.NewUUID()
 	containerConfig := &runtimeapi.ContainerConfig{
 		Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
-		Image:    &runtimeapi.ImageSpec{Image: framework.DefaultContainerImage},
-		Command:  []string{"touch", "/tmp/foo"},
+		Image: &runtimeapi.ImageSpec{
+			Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
+		},
+		Command: []string{"touch", "/tmp/foo"},
 		Linux: &runtimeapi.LinuxContainerConfig{
-			SecurityContext: &runtimeapi.LinuxContainerSecurityContext{
-				ApparmorProfile: profile,
-			},
+			SecurityContext: profile,
 		},
 	}
 
-	containerID, err := framework.CreateContainerWithError(rc, ic, containerConfig, sandboxID, sandboxConfig)
+	containerID, err := framework.CreateContainerWithError(
+		ctx,
+		rc,
+		ic,
+		containerConfig,
+		sandboxID,
+		sandboxConfig,
+	)
 	if shouldSucceed {
-		Expect(err).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
 		By("start container with apparmor")
-		err := rc.StartContainer(containerID)
+
+		err := rc.StartContainer(ctx, containerID)
 		Expect(err).NotTo(HaveOccurred())
 
 		// wait container started and check the status.
 		Eventually(func() runtimeapi.ContainerState {
-			return getContainerStatus(rc, containerID).State
+			return getContainerStatus(ctx, rc, containerID).GetState()
 		}, time.Minute, time.Second*4).Should(Equal(runtimeapi.ContainerState_CONTAINER_EXITED))
 	} else {
 		Expect(err).To(HaveOccurred())
@@ -134,48 +346,58 @@ func createContainerWithAppArmor(rc internalapi.RuntimeService, ic internalapi.I
 	return containerID
 }
 
-func checkContainerApparmor(rc internalapi.RuntimeService, containerID string, shoudRun bool) {
+func checkContainerApparmor(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	containerID string,
+	shouldRun bool,
+) {
 	By("get container status")
-	status, err := rc.ContainerStatus(containerID)
+
+	resp, err := rc.ContainerStatus(ctx, containerID, false)
 	Expect(err).NotTo(HaveOccurred())
 
-	if shoudRun {
-		Expect(status.GetExitCode()).To(Equal(int32(0)))
+	if shouldRun {
+		Expect(resp.GetStatus().GetExitCode()).To(Equal(int32(0)))
 	} else {
-		Expect(status.GetExitCode()).NotTo(Equal(int32(0)))
+		Expect(resp.GetStatus().GetExitCode()).NotTo(Equal(int32(0)))
 	}
 }
 
-func loadTestProfiles() error {
-	f, err := ioutil.TempFile("/tmp", "apparmor")
+func loadTestProfiles(ctx context.Context) error {
+	f, err := os.CreateTemp("/tmp", "apparmor")
 	if err != nil {
-		return errors.Wrap(err, "open temp file")
+		return fmt.Errorf("open temp file: %w", err)
 	}
+
 	defer os.Remove(f.Name())
 	defer f.Close()
 
-	// write test profiles to a temp file.
 	if _, err = f.WriteString(testProfiles); err != nil {
-		return errors.Wrap(err, "write profiles to file")
+		return fmt.Errorf("write profiles to file: %w", err)
 	}
 
-	// load apparmor profiles into kernel.
-	cmd := exec.Command("sudo", "apparmor_parser", "-r", "-W", f.Name())
+	binary, err := exec.LookPath("sudo")
+	if err != nil {
+		return fmt.Errorf("find sudo binary: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, binary, "apparmor_parser", "-r", "-W", f.Name())
 	stderr := &bytes.Buffer{}
 	cmd.Stderr = stderr
 	out, err := cmd.Output()
 	// apparmor_parser does not always return an error code, so consider any stderr output an error.
 	if err != nil || stderr.Len() > 0 {
 		if stderr.Len() > 0 {
-			glog.Warning(stderr.String())
-		}
-		if len(out) > 0 {
-			glog.Infof("apparmor_parser: %s", out)
+			logrus.Warn(stderr.String())
 		}
 
-		return errors.Wrap(err, "load profiles")
+		if len(out) > 0 {
+			logrus.Infof("apparmor_parser: %s", out)
+		}
+
+		return fmt.Errorf("load profiles: %w", err)
 	}
 
-	glog.V(2).Infof("Loaded profiles: %v", out)
 	return nil
 }

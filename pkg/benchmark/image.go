@@ -17,91 +17,281 @@ limitations under the License.
 package benchmark
 
 import (
+	"fmt"
+	"path"
 	"runtime"
+	"time"
 
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gmeasure"
+	"github.com/sirupsen/logrus"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
-var _ = framework.KubeDescribe("Container", func() {
-	f := framework.NewDefaultCRIFramework()
+const (
+	defaultImageBenchmarkTimeoutSeconds = 10
 
+	// defaultImageListingPrefix is for avoiding Docker Hub's rate limit.
+	defaultImageListingPrefix = "public.ecr.aws/docker/library/"
+)
+
+var defaultImageListingBenchmarkImagesAmd64 = []string{
+	defaultImageListingPrefix + "busybox:1.35.0-glibc",
+	defaultImageListingPrefix + "busybox:1-uclibc",
+	defaultImageListingPrefix + "busybox:1",
+	defaultImageListingPrefix + "busybox:1-glibc",
+	defaultImageListingPrefix + "busybox:1-musl",
+}
+
+var defaultImageListingBenchmarkImages = []string{
+	defaultImageListingPrefix + "busybox:1",
+	defaultImageListingPrefix + "busybox:1-glibc",
+	defaultImageListingPrefix + "busybox:1-musl",
+}
+
+var _ = framework.KubeDescribe("Image", func() {
 	var ic internalapi.ImageManagerService
 
-	BeforeEach(func() {
+	f := framework.NewDefaultCRIFramework()
+
+	testImageList := framework.TestContext.BenchmarkingParams.ImageListingBenchmarkImages
+	if len(testImageList) == 0 {
+		if runtime.GOARCH == "amd64" {
+			testImageList = defaultImageListingBenchmarkImagesAmd64
+		} else {
+			testImageList = defaultImageListingBenchmarkImages
+		}
+	}
+
+	BeforeEach(func(ctx SpecContext) {
 		ic = f.CRIClient.CRIImageClient
 	})
 
-	Context("benchmark about operations on Image", func() {
-		var err error
-
-		var testImageList []string
-		if runtime.GOARCH == "amd64" {
-			testImageList = []string{
-				"busybox:1.26.2-glibc",
-				"busybox:1-uclibc",
-				"busybox:1",
-				"busybox:1-glibc",
-				"busybox:1-musl",
+	AfterEach(func(ctx SpecContext) {
+		for _, imageName := range testImageList {
+			imageSpec := &runtimeapi.ImageSpec{
+				Image: imageName,
 			}
-		} else {
-			testImageList = []string{
-				"busybox:1",
-				"busybox:1-glibc",
-				"busybox:1-musl",
-			}
+			Expect(ic.RemoveImage(ctx, imageSpec)).NotTo(HaveOccurred())
 		}
+	})
 
-		AfterEach(func() {
-			for _, imageName := range testImageList {
+	Context("benchmark about operations on Image", func() {
+		It("benchmark about basic operations on Image", func(ctx SpecContext) {
+			var err error
+
+			imageBenchmarkTimeoutSeconds := defaultImageBenchmarkTimeoutSeconds
+			if framework.TestContext.BenchmarkingParams.ImageBenchmarkTimeoutSeconds > 0 {
+				imageBenchmarkTimeoutSeconds = framework.TestContext.BenchmarkingParams.ImageBenchmarkTimeoutSeconds
+			}
+
+			imagePullingBenchmarkImage := framework.TestContext.BenchmarkingParams.ImagePullingBenchmarkImage
+			// NOTE(aznashwan): default to using first test image from listing benchmark images:
+			if imagePullingBenchmarkImage == "" {
+				imagePullingBenchmarkImage = testImageList[0]
+				logrus.Infof("Defaulting to using following image: %s", imagePullingBenchmarkImage)
+			}
+
+			// Setup shared sampling config from TestContext:
+			samplingConfig := gmeasure.SamplingConfig{
+				N:           framework.TestContext.BenchmarkingParams.ImagesNumber,
+				NumParallel: framework.TestContext.BenchmarkingParams.ImagesNumberParallel,
+			}
+			if samplingConfig.N <= 0 {
+				Skip("skipping image lifecycle benchmarks since image number option was not set")
+			}
+
+			if samplingConfig.NumParallel < 1 {
+				samplingConfig.NumParallel = 1
+			}
+
+			// Setup image lifecycle results reporting channel:
+			lifecycleResultsSet := LifecycleBenchmarksResultsSet{
+				OperationsNames: []string{"PullImage", "StatusImage", "RemoveImage"},
+				NumParallel:     samplingConfig.NumParallel,
+				Datapoints:      make([]LifecycleBenchmarkDatapoint, 0),
+			}
+			lifecycleResultsManager := NewLifecycleBenchmarksResultsManager(
+				lifecycleResultsSet,
+				imageBenchmarkTimeoutSeconds,
+			)
+			lifecycleResultsChannel := lifecycleResultsManager.StartResultsConsumer()
+
+			// Image lifecycle benchmark experiment:
+			experiment := gmeasure.NewExperiment("ImageLifecycle")
+			experiment.Sample(func(idx int) {
+				var (
+					err                        error
+					lastStartTime, lastEndTime int64
+				)
+
+				durations := make([]int64, len(lifecycleResultsSet.OperationsNames))
+
 				imageSpec := &runtimeapi.ImageSpec{
-					Image: imageName,
+					Image: imagePullingBenchmarkImage,
 				}
-				ic.RemoveImage(imageSpec)
+
+				By(fmt.Sprintf("Pull Image %d", idx))
+
+				startTime := time.Now().UnixNano()
+				lastStartTime = startTime
+				imageID := framework.PullPublicImage(ctx, ic, imagePullingBenchmarkImage, nil)
+				lastEndTime = time.Now().UnixNano()
+				durations[0] = lastEndTime - lastStartTime
+
+				By(fmt.Sprintf("Status Image %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				_, err = ic.ImageStatus(ctx, imageSpec, false)
+				lastEndTime = time.Now().UnixNano()
+				durations[1] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to status Image")
+
+				By(fmt.Sprintf("Remove Image %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				err = ic.RemoveImage(ctx, imageSpec)
+				lastEndTime = time.Now().UnixNano()
+				durations[2] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to remove Image")
+
+				res := LifecycleBenchmarkDatapoint{
+					SampleIndex:           idx,
+					StartTime:             startTime,
+					EndTime:               lastEndTime,
+					OperationsDurationsNs: durations,
+					MetaInfo:              map[string]string{"imageId": imageID},
+				}
+				lifecycleResultsChannel <- &res
+			}, samplingConfig)
+
+			// Send nil and give the manager a minute to process any already-queued results:
+			lifecycleResultsChannel <- nil
+
+			err = lifecycleResultsManager.AwaitAllResults(60)
+			if err != nil {
+				logrus.Errorf("Results manager failed to await all results: %v", err)
+			}
+
+			if framework.TestContext.BenchmarkingOutputDir != "" {
+				filepath := path.Join(
+					framework.TestContext.BenchmarkingOutputDir,
+					"image_lifecycle_benchmark_data.json",
+				)
+
+				err = lifecycleResultsManager.WriteResultsFile(filepath)
+				if err != nil {
+					logrus.Errorf(
+						"Error occurred while writing benchmark results to file %s: %v",
+						filepath,
+						err,
+					)
+				}
+			} else {
+				logrus.Info(
+					"No benchmarking out dir provided, skipping writing benchmarking results",
+				)
+				logrus.Infof(
+					"Image lifecycle results were: %+v",
+					lifecycleResultsManager.resultsSet,
+				)
 			}
 		})
 
-		Measure("benchmark about basic operations on Image", func(b Benchmarker) {
-			imageSpec := &runtimeapi.ImageSpec{
-				Image: testImageList[0],
+		It("benchmark about listing Image", func(ctx SpecContext) {
+			var err error
+
+			imageBenchmarkTimeoutSeconds := defaultImageBenchmarkTimeoutSeconds
+			if framework.TestContext.BenchmarkingParams.ImageBenchmarkTimeoutSeconds > 0 {
+				imageBenchmarkTimeoutSeconds = framework.TestContext.BenchmarkingParams.ImageBenchmarkTimeoutSeconds
 			}
 
-			operation := b.Time("pull Image", func() {
-				framework.PullPublicImage(ic, testImageList[0], nil)
-			})
-			Expect(operation.Minutes()).Should(BeNumerically("<", 1), "pull Image shouldn't take too long.")
-
-			operation = b.Time("Image status", func() {
-				_, err = ic.ImageStatus(imageSpec)
-			})
-
-			framework.ExpectNoError(err, "failed to get image status: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "get image status shouldn't take too long.")
-
-			operation = b.Time("remove Image", func() {
-				err = ic.RemoveImage(imageSpec)
-			})
-
-			framework.ExpectNoError(err, "failed to remove image: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "remove Image shouldn't take too long.")
-
-		}, defaultOperationTimes)
-
-		Measure("benchmark about listing Image", func(b Benchmarker) {
-			for _, imageName := range testImageList {
-				framework.PullPublicImage(ic, imageName, nil)
+			// Setup shared sampling config from TestContext:
+			samplingConfig := gmeasure.SamplingConfig{
+				N:           framework.TestContext.BenchmarkingParams.ImagesNumber,
+				NumParallel: framework.TestContext.BenchmarkingParams.ImagesNumberParallel,
+			}
+			if samplingConfig.N <= 0 {
+				Skip(
+					"skipping image listing benchmarks since image listing number option was not set",
+				)
 			}
 
-			operation := b.Time("list Container", func() {
-				_, err = ic.ListImages(nil)
-			})
+			if samplingConfig.NumParallel < 1 {
+				samplingConfig.NumParallel = 1
+			}
+			// Setup image lifecycle results reporting channel:
+			imageListResultsSet := LifecycleBenchmarksResultsSet{
+				OperationsNames: []string{"ListImages"},
+				NumParallel:     samplingConfig.NumParallel,
+				Datapoints:      make([]LifecycleBenchmarkDatapoint, 0),
+			}
+			imageListResultsManager := NewLifecycleBenchmarksResultsManager(
+				imageListResultsSet,
+				imageBenchmarkTimeoutSeconds,
+			)
+			imagesResultsChannel := imageListResultsManager.StartResultsConsumer()
 
-			framework.ExpectNoError(err, "failed to list Image: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "list Image shouldn't take too long.")
-		}, defaultOperationTimes)
+			// Image listing benchmark experiment:
+			experiment := gmeasure.NewExperiment("ImageListing")
+			experiment.Sample(func(idx int) {
+				var err error
+
+				durations := make([]int64, len(imageListResultsSet.OperationsNames))
+
+				By(fmt.Sprintf("List Images %d", idx))
+
+				startTime := time.Now().UnixNano()
+				_, err = ic.ListImages(ctx, nil)
+				endTime := time.Now().UnixNano()
+				durations[0] = endTime - startTime
+
+				framework.ExpectNoError(err, "failed to List images")
+
+				res := LifecycleBenchmarkDatapoint{
+					SampleIndex:           idx,
+					StartTime:             startTime,
+					EndTime:               endTime,
+					OperationsDurationsNs: durations,
+					MetaInfo:              nil,
+				}
+				imagesResultsChannel <- &res
+			}, samplingConfig)
+
+			// Send nil and give the manager a minute to process any already-queued results:
+			imagesResultsChannel <- nil
+
+			err = imageListResultsManager.AwaitAllResults(60)
+			if err != nil {
+				logrus.Errorf("Results manager failed to await all results: %v", err)
+			}
+
+			if framework.TestContext.BenchmarkingOutputDir != "" {
+				filepath := path.Join(
+					framework.TestContext.BenchmarkingOutputDir,
+					"image_listing_benchmark_data.json",
+				)
+
+				err = imageListResultsManager.WriteResultsFile(filepath)
+				if err != nil {
+					logrus.Errorf(
+						"Error occurred while writing benchmark results to file %s: %v",
+						filepath,
+						err,
+					)
+				}
+			} else {
+				logrus.Info(
+					"No benchmarking out dir provided, skipping writing benchmarking results",
+				)
+				logrus.Infof("Image listing results were: %+v", imageListResultsManager.resultsSet)
+			}
+		})
 	})
 })

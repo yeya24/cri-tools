@@ -19,27 +19,26 @@ package e2e
 import (
 	"testing"
 
-	. "github.com/kubernetes-sigs/cri-tools/test/framework"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	. "sigs.k8s.io/cri-tools/test/framework"
 )
 
-// TestE2E runs the created specs
+const registry = "gcr.io/k8s-staging-cri-tools/"
+
+// TestE2E runs the created specs.
 func TestE2E(t *testing.T) {
+	t.Parallel()
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "e2e")
 }
 
 var t *TestFramework
 
-var _ = SynchronizedBeforeSuite(func() []byte {
-	// Setup only once
-	dir := SetupCrio()
-	return []byte(dir)
-
-}, func(dir []byte) {
+var _ = BeforeSuite(func() {
 	t = NewTestFramework()
-	t.Setup(string(dir))
+	t.Setup()
 })
 
 var _ = AfterSuite(func() {

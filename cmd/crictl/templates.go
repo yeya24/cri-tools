@@ -19,53 +19,69 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"strings"
+	"fmt"
 	"text/template"
 
-	"github.com/pkg/errors"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 func builtinTmplFuncs() template.FuncMap {
+	t := cases.Title(language.Und, cases.NoLower)
+	l := cases.Lower(language.Und)
+	u := cases.Upper(language.Und)
+
 	return template.FuncMap{
-		"json":  jsonBuiltinTmplFunc,
-		"title": strings.Title,
-		"lower": strings.ToLower,
-		"upper": strings.ToUpper,
+		outputTypeJSON: jsonBuiltinTmplFunc,
+		"title":        t.String,
+		"lower":        l.String,
+		"upper":        u.String,
 	}
 }
 
 // jsonBuiltinTmplFunc allows to jsonify result of template execution.
-func jsonBuiltinTmplFunc(v interface{}) string {
+func jsonBuiltinTmplFunc(v any) (string, error) {
 	o := new(bytes.Buffer)
+
 	enc := json.NewEncoder(o)
-	// FIXME(fuweid): should we panic?
-	enc.Encode(v)
-	return o.String()
+	if err := enc.Encode(v); err != nil {
+		return "", fmt.Errorf("unable to encode JSON: %w", err)
+	}
+
+	return o.String(), nil
 }
 
-// tmplExecuteRawJSON executes the template with interface{} with decoded by
+// tmplExecuteRawJSON executes the template with any with decoded by
 // rawJSON string.
-func tmplExecuteRawJSON(tmplStr string, rawJSON string) (string, error) {
+func tmplExecuteRawJSON(tmplStr, rawJSON string) (string, error) {
 	dec := json.NewDecoder(
 		bytes.NewReader([]byte(rawJSON)),
 	)
 	dec.UseNumber()
 
-	var raw interface{}
+	var raw any
 	if err := dec.Decode(&raw); err != nil {
-		return "", errors.Wrapf(err, "failed to decode json")
+		return "", fmt.Errorf("failed to decode json: %w", err)
 	}
 
-	var o = new(bytes.Buffer)
+	o := new(bytes.Buffer)
+
 	tmpl, err := template.New("tmplExecuteRawJSON").Funcs(builtinTmplFuncs()).Parse(tmplStr)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to generate go-template")
+		return "", fmt.Errorf("failed to generate go-template: %w", err)
 	}
 
 	// return error if key doesn't exist
 	tmpl = tmpl.Option("missingkey=error")
 	if err := tmpl.Execute(o, raw); err != nil {
-		return "", errors.Wrapf(err, "failed to template data")
+		return "", fmt.Errorf("failed to template data: %w", err)
 	}
+
 	return o.String(), nil
+}
+
+func validateTemplate(tmplStr string) error {
+	_, err := template.New("").Funcs(builtinTmplFuncs()).Parse(tmplStr)
+
+	return err
 }

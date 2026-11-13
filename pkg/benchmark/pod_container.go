@@ -17,58 +17,100 @@ limitations under the License.
 package benchmark
 
 import (
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gmeasure"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/common"
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
+
+const (
+	defaultPodContainerBenchmarkTimeoutSeconds = 5
+)
+
+func getPodContainerBenchmarkTimeoutSeconds() int {
+	timeout := defaultPodContainerBenchmarkTimeoutSeconds
+	if framework.TestContext.BenchmarkingParams.PodContainerStartBenchmarkTimeoutSeconds > 0 {
+		timeout = framework.TestContext.BenchmarkingParams.PodContainerStartBenchmarkTimeoutSeconds
+	}
+
+	return timeout
+}
 
 var _ = framework.KubeDescribe("PodSandbox", func() {
 	f := framework.NewDefaultCRIFramework()
 
-	var rc internalapi.RuntimeService
-	var ic internalapi.ImageManagerService
-	var podID string
+	var (
+		experiment *gmeasure.Experiment
+		rc         internalapi.RuntimeService
+		ic         internalapi.ImageManagerService
+	)
 
-	BeforeEach(func() {
+	BeforeEach(func(ctx SpecContext) {
+		experiment = gmeasure.NewExperiment("start-container-benchmark")
+		AddReportEntry(experiment.Name, experiment)
+
 		rc = f.CRIClient.CRIRuntimeClient
 		ic = f.CRIClient.CRIImageClient
 	})
 
-	AfterEach(func() {
-		By("stop PodSandbox")
-		rc.StopPodSandbox(podID)
-		By("delete PodSandbox")
-		rc.RemovePodSandbox(podID)
-	})
-
 	Context("benchmark about start a container from scratch", func() {
-		Measure("benchmark about start a container from scratch", func(b Benchmarker) {
-			var err error
-
+		It("benchmark about start a container from scratch", func(ctx SpecContext) {
 			podSandboxName := "PodSandbox-for-creating-pod-and-container-performance-test-" + framework.NewUUID()
 			uid := framework.DefaultUIDPrefix + framework.NewUUID()
 			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-
 			config := &runtimeapi.PodSandboxConfig{
-				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
-				Linux:    &runtimeapi.LinuxPodSandboxConfig{},
+				Metadata: framework.BuildPodSandboxMetadata(
+					podSandboxName,
+					uid,
+					namespace,
+					framework.DefaultAttempt,
+				),
+				Linux: &runtimeapi.LinuxPodSandboxConfig{
+					CgroupParent: common.GetCgroupParent(ctx, rc),
+				},
 			}
 
-			operation := b.Time("create PodSandbox and container", func() {
+			benchmark := func() {
 				By("run PodSandbox")
-				podID, err = rc.RunPodSandbox(config, framework.TestContext.RuntimeHandler)
-				framework.ExpectNoError(err, "failed to create PodSandbox: %v", err)
-				By("create container in PodSandbox")
-				containerID := framework.CreateDefaultContainer(rc, ic, podID, config, "Pod-Container-for-creating-benchmark-")
-				By("start container in PodSandbox")
-				err = rc.StartContainer(containerID)
-			})
 
-			framework.ExpectNoError(err, "failed to start Container: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 5), "create PodSandbox shouldn't take too long.")
-		}, defaultOperationTimes)
+				podID, err := rc.RunPodSandbox(ctx, config, framework.TestContext.RuntimeHandler)
+				framework.ExpectNoError(err, "failed to create PodSandbox")
+
+				By("create container in PodSandbox")
+
+				containerID := framework.CreateDefaultContainer(
+					ctx,
+					rc,
+					ic,
+					podID,
+					config,
+					"Pod-Container-for-creating-benchmark-",
+				)
+
+				By("start container in PodSandbox")
+
+				err = rc.StartContainer(ctx, containerID)
+				framework.ExpectNoError(err, "failed to start Container")
+
+				By("stop PodSandbox")
+				Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
+				By("delete PodSandbox")
+				Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			}
+
+			// Run a single test to ensure images are available and everything works
+			benchmark()
+
+			// Do the benchmark
+			operation := experiment.MeasureDuration("create PodSandbox and container", benchmark)
+
+			Expect(
+				operation.Seconds(),
+			).Should(BeNumerically("<", getPodContainerBenchmarkTimeoutSeconds()), "create PodSandbox shouldn't take too long.")
+		})
 	})
 })

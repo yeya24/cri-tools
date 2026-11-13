@@ -17,48 +17,55 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-)
-
-const (
-	criClientVersion = "v1alpha2"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
+	remote "k8s.io/cri-client/pkg"
 )
 
 var runtimeVersionCommand = &cli.Command{
 	Name:  "version",
 	Usage: "Display runtime version information",
-	Action: func(context *cli.Context) error {
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 0 {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
-		err = Version(runtimeClient, criClientVersion)
-		if err != nil {
-			return errors.Wrap(err, "getting the runtime version")
+
+		if err := Version(c.Context, runtimeClient, string(remote.CRIVersionV1)); err != nil {
+			return fmt.Errorf("getting the runtime version: %w", err)
 		}
+
 		return nil
 	},
 }
 
 // Version sends a VersionRequest to the server, and parses the returned VersionResponse.
-func Version(client pb.RuntimeServiceClient, version string) error {
+func Version(ctx context.Context, client internalapi.RuntimeService, version string) error {
 	request := &pb.VersionRequest{Version: version}
 	logrus.Debugf("VersionRequest: %v", request)
-	r, err := client.Version(context.Background(), request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) (*pb.VersionResponse, error) {
+		return client.Version(ctx, version)
+	})
 	logrus.Debugf("VersionResponse: %v", r)
+
 	if err != nil {
 		return err
 	}
-	fmt.Println("Version: ", r.Version)
-	fmt.Println("RuntimeName: ", r.RuntimeName)
-	fmt.Println("RuntimeVersion: ", r.RuntimeVersion)
-	fmt.Println("RuntimeApiVersion: ", r.RuntimeApiVersion)
+
+	fmt.Println("Version: ", r.GetVersion())
+	fmt.Println("RuntimeName: ", r.GetRuntimeName())
+	fmt.Println("RuntimeVersion: ", r.GetRuntimeVersion())
+	fmt.Println("RuntimeApiVersion: ", r.GetRuntimeApiVersion())
+
 	return nil
 }

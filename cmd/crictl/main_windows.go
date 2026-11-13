@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -23,8 +23,15 @@ import (
 	"path/filepath"
 )
 
-var defaultRuntimeEndpoints = []string{"npipe:////./pipe/dockershim", "npipe:////./pipe/containerd", "npipe:////./pipe/crio"}
-var defaultConfigPath string
+var (
+	defaultRuntimeEndpoints = []string{
+		"npipe:////./pipe/containerd-containerd",
+		"npipe:////./pipe/cri-dockerd",
+	}
+	defaultConfigPath string
+)
+
+var shutdownSignals = []os.Signal{os.Interrupt}
 
 func init() {
 	defaultConfigPath = filepath.Join(os.Getenv("USERPROFILE"), ".crictl", "crictl.yaml")

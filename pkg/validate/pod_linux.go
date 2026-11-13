@@ -17,22 +17,26 @@ limitations under the License.
 package validate
 
 import (
+	"context"
 	"strings"
 	"time"
 
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/common"
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
 var _ = framework.KubeDescribe("PodSandbox", func() {
 	f := framework.NewDefaultCRIFramework()
 
-	var rc internalapi.RuntimeService
-	var ic internalapi.ImageManagerService
+	var (
+		rc internalapi.RuntimeService
+		ic internalapi.ImageManagerService
+	)
 
 	BeforeEach(func() {
 		rc = f.CRIClient.CRIRuntimeClient
@@ -40,68 +44,103 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 	})
 
 	Context("runtime should support sysctls", func() {
-		var podID string
-		var podConfig *runtimeapi.PodSandboxConfig
+		var (
+			podID     string
+			podConfig *runtimeapi.PodSandboxConfig
+		)
 
-		AfterEach(func() {
-			By("stop PodSandbox")
-			rc.StopPodSandbox(podID)
-			By("delete PodSandbox")
-			rc.RemovePodSandbox(podID)
+		AfterEach(func(ctx SpecContext) {
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
-		It("should support safe sysctls", func() {
-			podID, podConfig = createSandboxWithSysctls(rc, map[string]string{
+		It("should support safe sysctls", func(ctx SpecContext) {
+			podID, podConfig = createSandboxWithSysctls(ctx, rc, map[string]string{
 				"kernel.shm_rmid_forced": "1",
 			})
 
 			By("create a default container")
-			containerID := framework.CreateDefaultContainer(rc, ic, podID, podConfig, "container-shm-rmid-forced")
+
+			containerID := framework.CreateDefaultContainer(
+				ctx,
+				rc,
+				ic,
+				podID,
+				podConfig,
+				"container-shm-rmid-forced",
+			)
 
 			By("start container")
-			startContainer(rc, containerID)
+			startContainer(ctx, rc, containerID)
 
 			By("check sysctls kernel.shm_rmid_forced")
-			checkSetSysctls(rc, containerID, "/proc/sys/kernel/shm_rmid_forced", "1")
+			checkSetSysctls(ctx, rc, containerID, "/proc/sys/kernel/shm_rmid_forced", "1")
 		})
 
-		It("should support unsafe sysctls", func() {
-			podID, podConfig = createSandboxWithSysctls(rc, map[string]string{
+		It("should support unsafe sysctls", func(ctx SpecContext) {
+			podID, podConfig = createSandboxWithSysctls(ctx, rc, map[string]string{
 				"fs.mqueue.msg_max": "100",
 			})
 
 			By("create a default container")
-			containerID := framework.CreateDefaultContainer(rc, ic, podID, podConfig, "container-fs-mqueue-msg-max")
+
+			containerID := framework.CreateDefaultContainer(
+				ctx,
+				rc,
+				ic,
+				podID,
+				podConfig,
+				"container-fs-mqueue-msg-max",
+			)
 
 			By("start container")
-			startContainer(rc, containerID)
+			startContainer(ctx, rc, containerID)
 
 			By("check sysctls fs.mqueue.msg_max")
-			checkSetSysctls(rc, containerID, "/proc/sys/fs/mqueue/msg_max", "100")
+			checkSetSysctls(ctx, rc, containerID, "/proc/sys/fs/mqueue/msg_max", "100")
 		})
 	})
 })
 
 // createSandboxWithSysctls creates a PodSandbox with specified sysctls.
-func createSandboxWithSysctls(rc internalapi.RuntimeService, sysctls map[string]string) (string, *runtimeapi.PodSandboxConfig) {
+func createSandboxWithSysctls(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	sysctls map[string]string,
+) (string, *runtimeapi.PodSandboxConfig) {
 	By("create a PodSandbox with sysctls")
+
 	podSandboxName := "pod-sandbox-with-sysctls-" + framework.NewUUID()
 	uid := framework.DefaultUIDPrefix + framework.NewUUID()
 	namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-
 	podConfig := &runtimeapi.PodSandboxConfig{
-		Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
+		Metadata: framework.BuildPodSandboxMetadata(
+			podSandboxName,
+			uid,
+			namespace,
+			framework.DefaultAttempt,
+		),
 		Linux: &runtimeapi.LinuxPodSandboxConfig{
-			Sysctls: sysctls,
+			CgroupParent: common.GetCgroupParent(ctx, rc),
+			Sysctls:      sysctls,
 		},
 	}
-	return framework.RunPodSandbox(rc, podConfig), podConfig
+
+	return framework.RunPodSandbox(ctx, rc, podConfig), podConfig
 }
 
 // checkSetSysctls checks whether sysctl settings is equal to expected string.
-func checkSetSysctls(rc internalapi.RuntimeService, containerID, sysctlPath, expected string) {
+func checkSetSysctls(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	containerID, sysctlPath, expected string,
+) {
 	cmd := []string{"cat", sysctlPath}
-	stdout, _, err := rc.ExecSync(containerID, cmd, time.Duration(defaultExecSyncTimeout)*time.Second)
+	stdout, _, err := rc.ExecSync(
+		ctx,
+		containerID,
+		cmd,
+		time.Duration(defaultExecSyncTimeout)*time.Second,
+	)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(strings.TrimSpace(string(stdout))).To(Equal(expected))
 }

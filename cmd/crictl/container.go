@@ -17,40 +17,42 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"sort"
+	"os"
+	"path/filepath"
+	goruntime "runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docker/go-units"
 	godigest "github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubelet/pkg/types"
+
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
-type containerByCreated []*pb.Container
-
-func (a containerByCreated) Len() int      { return len(a) }
-func (a containerByCreated) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-func (a containerByCreated) Less(i, j int) bool {
-	return a[i].CreatedAt > a[j].CreatedAt
-}
-
 type createOptions struct {
-	// podID of the container
-	podID string
-
 	// the config and pod options
 	*runOptions
+
+	// podID of the container
+	podID string
 }
 
 type runOptions struct {
+	// the image pull options
+	*pullOptions
+
 	// configPath is path to the config for container
 	configPath string
 
@@ -59,9 +61,6 @@ type runOptions struct {
 
 	// the create timeout
 	timeout time.Duration
-
-	// the image pull options
-	*pullOptions
 }
 
 type pullOptions struct {
@@ -75,106 +74,138 @@ type pullOptions struct {
 	// auth is a base64 encoded 'USERNAME[:PASSWORD]' string used for
 	// authentication with a registry when pulling an image
 	auth string
+
+	// Username to use for accessing the registry
+	// password will be requested on the command line
+	username string
+
+	// timeout is the maximum time used for the image pull
+	timeout time.Duration
 }
 
-var createPullFlags = []cli.Flag{
-	&cli.BoolFlag{
-		Name:  "no-pull",
-		Usage: "Do not pull the image on container creation (overrides pull-image-on-create=true in config)",
-	},
-	&cli.BoolFlag{
-		Name:  "with-pull",
-		Usage: "Pull the image on container creation (overrides pull-image-on-create=false in config)",
-	},
-	&cli.StringFlag{
-		Name:  "creds",
-		Value: "",
-		Usage: "Use `USERNAME[:PASSWORD]` for accessing the registry",
-	},
-	&cli.StringFlag{
-		Name:  "auth",
-		Value: "",
-		Usage: "Use `AUTH_STRING` for accessing the registry. AUTH_STRING is a base64 encoded 'USERNAME[:PASSWORD]'",
-	},
+func newContainerPullFlags(noPullUsage, withPullUsage string) []cli.Flag {
+	return append([]cli.Flag{
+		&cli.BoolFlag{
+			Name:  "no-pull",
+			Usage: noPullUsage,
+		},
+		&cli.BoolFlag{
+			Name:  "with-pull",
+			Usage: withPullUsage,
+		},
+		cancelTimeoutFlag,
+	}, pullFlags...)
 }
 
-var runPullFlags = []cli.Flag{
-	&cli.BoolFlag{
-		Name:  "no-pull",
-		Usage: "Do not pull the image (overrides disable-pull-on-run=false in config)",
-	},
-	&cli.BoolFlag{
-		Name:  "with-pull",
-		Usage: "Pull the image (overrides disable-pull-on-run=true in config)",
-	},
+var createPullFlags = newContainerPullFlags(
+	"Do not pull the image on container creation (overrides pull-image-on-create=true in config)",
+	"Pull the image on container creation (overrides pull-image-on-create=false in config)",
+)
+
+var runPullFlags = append(
+	newContainerPullFlags(
+		"Do not pull the image (overrides disable-pull-on-run=false in config)",
+		"Pull the image (overrides disable-pull-on-run=true in config)",
+	),
 	&cli.StringFlag{
-		Name:  "creds",
-		Value: "",
-		Usage: "Use `USERNAME[:PASSWORD]` for accessing the registry",
+		Name:    "runtime",
+		Aliases: []string{"r"},
+		Usage:   "Runtime handler to use. Available options are defined by the container runtime.",
 	},
-	&cli.StringFlag{
-		Name:  "auth",
-		Value: "",
-		Usage: "Use `AUTH_STRING` for accessing the registry. AUTH_STRING is a base64 encoded 'USERNAME[:PASSWORD]'",
+)
+
+var subcommands = []*cli.Command{{
+	Name:    "jsonschema",
+	Aliases: []string{"js"},
+	Usage:   "Display the JSON schema for the pod or container config",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:    "pod",
+			Aliases: []string{"p"},
+			Usage:   "Print the pod JSON schema, which will be generated from the PodSandboxConfig of the CRI API compiled with this version of crictl",
+		},
+		&cli.BoolFlag{
+			Name:    "container",
+			Aliases: []string{"c"},
+			Usage:   "Print the container JSON schema, which will be generated from the ContainerConfig of the CRI API compiled with this version of crictl",
+		},
 	},
-}
+	UseShortOptionHandling: true,
+	Action: func(c *cli.Context) error {
+		if !c.IsSet("pod") && !c.IsSet("container") {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		if c.IsSet("pod") {
+			if err := printJSONSchema(&pb.PodSandboxConfig{}); err != nil {
+				return fmt.Errorf("print pod sandbox config JSON schema: %w", err)
+			}
+		}
+
+		if c.IsSet("container") {
+			if err := printJSONSchema(&pb.ContainerConfig{}); err != nil {
+				return fmt.Errorf("print container config JSON schema: %w", err)
+			}
+		}
+
+		return nil
+	},
+}}
 
 var createContainerCommand = &cli.Command{
-	Name:      "create",
-	Usage:     "Create a new container",
-	ArgsUsage: "POD container-config.[json|yaml] pod-config.[json|yaml]",
-	Flags: append(createPullFlags, &cli.DurationFlag{
-		Name:    "cancel-timeout",
-		Aliases: []string{"T"},
-		Usage:   "Seconds to wait for a container create request to complete before cancelling the request",
-	}),
-
-	Action: func(context *cli.Context) error {
-		if context.Args().Len() != 3 {
-			return cli.ShowSubcommandHelp(context)
-		}
-		if context.Bool("no-pull") == true && context.Bool("with-pull") == true {
-			return errors.New("confict: no-pull and with-pull are both set")
+	Name:        "create",
+	Usage:       "Create a new container",
+	ArgsUsage:   "POD container-config.[json|yaml] pod-config.[json|yaml]",
+	Flags:       createPullFlags,
+	Subcommands: subcommands,
+	Action: func(c *cli.Context) (err error) {
+		if c.Args().Len() != 3 {
+			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
-		if err != nil {
-			return err
+		if c.Bool("no-pull") && c.Bool("with-pull") {
+			return errors.New("conflict: no-pull and with-pull are both set")
 		}
-		defer closeConnection(context, runtimeConn)
 
-		withPull := (!context.Bool("no-pull") && PullImageOnCreate) || context.Bool("with-pull")
+		cfg := configFromContext(c)
+		withPull := (!c.Bool("no-pull") && cfg.PullImageOnCreate) || c.Bool("with-pull")
 
-		var imageClient pb.ImageServiceClient
-		var imageConn *grpc.ClientConn
-
+		var imageClient internalapi.ImageManagerService
 		if withPull {
-			imageClient, imageConn, err = getImageClient(context)
+			imageClient, err = cfg.GetImageService(c.Context)
 			if err != nil {
 				return err
 			}
-			defer closeConnection(context, imageConn)
 		}
 
 		opts := createOptions{
-			podID: context.Args().Get(0),
+			podID: c.Args().Get(0),
 			runOptions: &runOptions{
-				configPath: context.Args().Get(1),
-				podConfig:  context.Args().Get(2),
+				configPath: c.Args().Get(1),
+				podConfig:  c.Args().Get(2),
 				pullOptions: &pullOptions{
 					withPull: withPull,
-					creds:    context.String("creds"),
-					auth:     context.String("auth"),
+					creds:    c.String("creds"),
+					auth:     c.String("auth"),
+					username: c.String("username"),
+					timeout:  c.Duration("pull-timeout"),
 				},
-				timeout: context.Duration("cancel-timeout"),
+				timeout: c.Duration("cancel-timeout"),
 			},
 		}
 
-		ctrID, err := CreateContainer(imageClient, runtimeClient, opts)
+		runtimeClient, err := cfg.GetRuntimeService(c.Context, opts.timeout)
 		if err != nil {
-			return errors.Wrap(err, "creating container")
+			return err
 		}
+
+		ctrID, err := CreateContainer(c.Context, imageClient, runtimeClient, opts)
+		if err != nil {
+			return fmt.Errorf("creating container: %w", err)
+		}
+
 		fmt.Println(ctrID)
+
 		return nil
 	},
 }
@@ -183,23 +214,23 @@ var startContainerCommand = &cli.Command{
 	Name:      "start",
 	Usage:     "Start one or more created containers",
 	ArgsUsage: "CONTAINER-ID [CONTAINER-ID...]",
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
+	Action: func(c *cli.Context) error {
+		if c.NArg() == 0 {
+			return errIDEmpty
 		}
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
-		for i := 0; i < context.NArg(); i++ {
-			containerID := context.Args().Get(i)
-			err := StartContainer(runtimeClient, containerID)
-			if err != nil {
-				return errors.Wrapf(err, "starting the container %q", containerID)
+		for i := range c.NArg() {
+			containerID := c.Args().Get(i)
+			if err := StartContainer(c.Context, runtimeClient, containerID); err != nil {
+				return fmt.Errorf("starting the container %q: %w", containerID, err)
 			}
 		}
+
 		return nil
 	},
 }
@@ -209,6 +240,14 @@ var updateContainerCommand = &cli.Command{
 	Usage:     "Update one or more running containers",
 	ArgsUsage: "CONTAINER-ID [CONTAINER-ID...]",
 	Flags: []cli.Flag{
+		&cli.Int64Flag{
+			Name:  "cpu-count",
+			Usage: "(Windows only) Number of CPUs available to the container",
+		},
+		&cli.Int64Flag{
+			Name:  "cpu-maximum",
+			Usage: "(Windows only) Portion of CPU cycles specified as a percentage * 100",
+		},
 		&cli.Int64Flag{
 			Name:  "cpu-period",
 			Usage: "CPU CFS period to be used for hardcapping (in usecs). 0 to use system default",
@@ -233,33 +272,45 @@ var updateContainerCommand = &cli.Command{
 			Name:  "cpuset-mems",
 			Usage: "Memory node(s) to use",
 		},
+		&cli.Int64Flag{
+			Name:  "oom-score-adj",
+			Usage: "OOM Killer score to use",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
+	Action: func(c *cli.Context) error {
+		if c.NArg() == 0 {
+			return errIDEmpty
 		}
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
-		options := updateOptions{
-			CPUPeriod:          context.Int64("cpu-period"),
-			CPUQuota:           context.Int64("cpu-quota"),
-			CPUShares:          context.Int64("cpu-share"),
-			CpusetCpus:         context.String("cpuset-cpus"),
-			CpusetMems:         context.String("cpuset-mems"),
-			MemoryLimitInBytes: context.Int64("memory"),
+		options := &updateOptions{
+			CPUCount:           c.Int64("cpu-count"),
+			CPUMaximum:         c.Int64("cpu-maximum"),
+			CPUPeriod:          c.Int64("cpu-period"),
+			CPUQuota:           c.Int64("cpu-quota"),
+			CPUShares:          c.Int64("cpu-share"),
+			CpusetCpus:         c.String("cpuset-cpus"),
+			CpusetMems:         c.String("cpuset-mems"),
+			MemoryLimitInBytes: c.Int64("memory"),
+			OomScoreAdj:        c.Int64("oom-score-adj"),
 		}
 
-		for i := 0; i < context.NArg(); i++ {
-			containerID := context.Args().Get(i)
-			err := UpdateContainerResources(runtimeClient, containerID, options)
-			if err != nil {
-				return errors.Wrapf(err, "updating container resources for %q", containerID)
+		for i := range c.NArg() {
+			containerID := c.Args().Get(i)
+			if err := UpdateContainerResources(
+				c.Context,
+				runtimeClient,
+				containerID,
+				options,
+			); err != nil {
+				return fmt.Errorf("updating container resources for %q: %w", containerID, err)
 			}
 		}
+
 		return nil
 	},
 }
@@ -275,24 +326,63 @@ var stopContainerCommand = &cli.Command{
 			Aliases: []string{"t"},
 			Usage:   "Seconds to wait to kill the container after a graceful stop is requested",
 		},
+		&cli.BoolFlag{
+			Name:    "all",
+			Aliases: []string{"a"},
+			Usage:   "Stop all running containers",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
-		}
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+	Action: func(c *cli.Context) error {
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
-		for i := 0; i < context.NArg(); i++ {
-			containerID := context.Args().Get(i)
-			err := StopContainer(runtimeClient, containerID, context.Int64("timeout"))
+		if c.Bool("all") && c.NArg() > 0 {
+			return cli.Exit("cannot specify CONTAINER-ID(s) when using --all", 1)
+		}
+
+		var containerIDs []string
+
+		if c.Bool("all") {
+			opts := &listOptions{
+				all:   false, // Only stop running containers
+				state: "running",
+			}
+
+			containers, err := ListContainers(c.Context, runtimeClient, nil, opts)
 			if err != nil {
-				return errors.Wrapf(err, "stopping the container %q", containerID)
+				return fmt.Errorf("listing containers: %w", err)
+			}
+
+			if len(containers) == 0 {
+				fmt.Println("No running containers found.")
+
+				return nil
+			}
+
+			for _, container := range containers {
+				containerIDs = append(containerIDs, container.GetId())
+			}
+		} else {
+			if c.NArg() == 0 {
+				return cli.Exit("you must specify at least one CONTAINER-ID or use --all", 1)
+			}
+
+			containerIDs = c.Args().Slice()
+		}
+
+		for _, containerID := range containerIDs {
+			if err := StopContainer(
+				c.Context,
+				runtimeClient,
+				containerID,
+				c.Int64("timeout"),
+			); err != nil {
+				return fmt.Errorf("stopping the container %q: %w", containerID, err)
 			}
 		}
+
 		return nil
 	},
 }
@@ -309,71 +399,89 @@ var removeContainerCommand = &cli.Command{
 			Usage:   "Force removal of the container, disregarding if running",
 		},
 		&cli.BoolFlag{
+			Name:    "keep-logs",
+			Aliases: []string{"k"},
+			Usage:   "Preserve the container log file and its rotations",
+		},
+		&cli.BoolFlag{
 			Name:    "all",
 			Aliases: []string{"a"},
 			Usage:   "Remove all containers",
 		},
 	},
 	Action: func(ctx *cli.Context) error {
-		runtimeClient, runtimeConn, err := getRuntimeClient(ctx)
+		runtimeClient, err := configFromContext(ctx).GetRuntimeService(ctx.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(ctx, runtimeConn)
 
-		ids := ctx.Args().Slice()
-		if ctx.Bool("all") {
-			r, err := runtimeClient.ListContainers(context.Background(),
-				&pb.ListContainersRequest{})
-			if err != nil {
-				return err
-			}
-			ids = nil
-			for _, ctr := range r.GetContainers() {
-				ids = append(ids, ctr.GetId())
-			}
+		ids, err := collectIDs(
+			ctx.Context,
+			ctx,
+			func(ctx context.Context) ([]*pb.Container, error) {
+				return runtimeClient.ListContainers(ctx, nil)
+			},
+			"container",
+		)
+		if err != nil || len(ids) == 0 {
+			return err
 		}
 
-		if len(ids) == 0 {
-			return cli.ShowSubcommandHelp(ctx)
-		}
-
-		errored := false
+		funcs := []func() error{}
 		for _, id := range ids {
-			resp, err := runtimeClient.ContainerStatus(context.Background(),
-				&pb.ContainerStatusRequest{ContainerId: id})
-			if err != nil {
-				logrus.Error(err)
-				errored = true
-				continue
-			}
-			if resp.GetStatus().GetState() == pb.ContainerState_CONTAINER_RUNNING {
-				if ctx.Bool("force") {
-					if err := StopContainer(runtimeClient, id, 0); err != nil {
-						logrus.Errorf("stopping the container %q failed: %v", id, err)
-						errored = true
-						continue
-					}
-					continue
-				} else {
-					logrus.Errorf("container %q is running, please stop it first", id)
-					errored = true
-					continue
+			funcs = append(funcs, func() error {
+				resp, err := InterruptableRPC(
+					ctx.Context,
+					func(ctx context.Context) (*pb.ContainerStatusResponse, error) {
+						return runtimeClient.ContainerStatus(ctx, id, false)
+					},
+				)
+				if err != nil {
+					return fmt.Errorf("getting container status %q: %w", id, err)
 				}
-			}
 
-			err = RemoveContainer(runtimeClient, id)
-			if err != nil {
-				logrus.Errorf("removing container %q failed: %v", id, err)
-				errored = true
-				continue
-			}
+				if resp.GetStatus().GetState() == pb.ContainerState_CONTAINER_RUNNING {
+					if ctx.Bool("force") {
+						if err := StopContainer(ctx.Context, runtimeClient, id, 0); err != nil {
+							return fmt.Errorf("stopping the container %q: %w", id, err)
+						}
+					} else {
+						return fmt.Errorf("container %q is running, please stop it first", id)
+					}
+				}
+
+				err = RemoveContainer(ctx.Context, runtimeClient, id)
+				if err != nil {
+					return fmt.Errorf("removing container %q: %w", id, err)
+				} else if !ctx.Bool("keep-logs") {
+					logPath := resp.GetStatus().GetLogPath()
+					if logPath != "" {
+						logRotations, err := filepath.Glob(logPath + ".*")
+						if err != nil {
+							logRotations = []string{}
+						}
+
+						logRotations = append(logRotations, logPath)
+
+						for _, logFile := range logRotations {
+							err = os.Remove(logFile)
+							if err != nil {
+								logrus.Errorf(
+									"removing log file %s for container %q failed: %v",
+									logFile,
+									id,
+									err,
+								)
+							}
+						}
+					}
+				}
+
+				return nil
+			})
 		}
 
-		if errored {
-			return fmt.Errorf("unable to remove container(s)")
-		}
-		return nil
+		return AggregateGoroutines(funcs...)
 	},
 }
 
@@ -396,24 +504,107 @@ var containerStatusCommand = &cli.Command{
 			Name:  "template",
 			Usage: "The template string is only used when output is go-template; The Template format is golang template",
 		},
+		&cli.StringFlag{
+			Name:  "name",
+			Usage: "Filter by container name regular expression pattern",
+		},
+		&cli.StringFlag{
+			Name:  "namespace",
+			Usage: "Filter by pod namespace regular expression pattern",
+		},
+		&cli.StringFlag{
+			Name:    "pod",
+			Aliases: []string{"p"},
+			Usage:   "Filter by pod id",
+		},
+		&cli.StringFlag{
+			Name:  "image",
+			Usage: "Filter by container image",
+		},
+		&cli.StringFlag{
+			Name:    "state",
+			Aliases: []string{"s"},
+			Usage:   "Filter by container state",
+		},
+		&cli.StringSliceFlag{
+			Name:  "label",
+			Usage: "Filter by key=value label",
+		},
+		&cli.BoolFlag{
+			Name:    "latest",
+			Aliases: []string{"l"},
+			Usage:   "Show the most recently created container (includes all states)",
+		},
+		&cli.IntFlag{
+			Name:    "last",
+			Aliases: []string{"n"},
+			Usage:   "Show last n recently created containers (includes all states). Set 0 for unlimited.",
+		},
+		&cli.BoolFlag{
+			Name:    "all",
+			Aliases: []string{"a"},
+			Usage:   "Show all containers",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
-		}
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+	Action: func(c *cli.Context) error {
+		cfg := configFromContext(c)
+
+		runtimeClient, err := cfg.GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
-		for i := 0; i < context.NArg(); i++ {
-			containerID := context.Args().Get(i)
-			err := ContainerStatus(runtimeClient, containerID, context.String("output"), context.String("template"), context.Bool("quiet"))
+		imageClient, err := cfg.GetImageService(c.Context)
+		if err != nil {
+			return err
+		}
+
+		ids := c.Args().Slice()
+
+		if len(ids) == 0 {
+			opts := &listOptions{
+				nameRegexp:         c.String("name"),
+				podID:              c.String("pod"),
+				podNamespaceRegexp: c.String("namespace"),
+				image:              c.String("image"),
+				state:              c.String("state"),
+				latest:             c.Bool("latest"),
+				last:               c.Int("last"),
+				all:                c.Bool("all"),
+			}
+
+			opts.labels, err = parseLabelStringSlice(c.StringSlice("label"))
 			if err != nil {
-				return errors.Wrapf(err, "getting the status of the container %q", containerID)
+				return err
+			}
+
+			ctrs, err := ListContainers(c.Context, runtimeClient, imageClient, opts)
+			if err != nil {
+				return fmt.Errorf("listing containers: %w", err)
+			}
+
+			for _, ctr := range ctrs {
+				ids = append(ids, ctr.GetId())
 			}
 		}
+
+		if len(ids) == 0 {
+			logrus.Error("No IDs provided or nothing found per filter")
+
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		if err := containerStatus(
+			c.Context,
+			runtimeClient,
+			ids,
+			c.String("output"),
+			c.String("template"),
+			c.Bool("quiet"),
+		); err != nil {
+			return fmt.Errorf("get the status of containers: %w", err)
+		}
+
 		return nil
 	},
 }
@@ -430,29 +621,24 @@ var listContainersCommand = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name:  "id",
-			Value: "",
 			Usage: "Filter by container id",
 		},
 		&cli.StringFlag{
 			Name:  "name",
-			Value: "",
-			Usage: "filter by container name regular expression pattern",
+			Usage: "Filter by container name regular expression pattern",
 		},
 		&cli.StringFlag{
 			Name:    "pod",
 			Aliases: []string{"p"},
-			Value:   "",
 			Usage:   "Filter by pod id",
 		},
 		&cli.StringFlag{
 			Name:  "image",
-			Value: "",
 			Usage: "Filter by container image",
 		},
 		&cli.StringFlag{
 			Name:    "state",
 			Aliases: []string{"s"},
-			Value:   "",
 			Usage:   "Filter by container state",
 		},
 		&cli.StringSliceFlag{
@@ -468,7 +654,7 @@ var listContainersCommand = &cli.Command{
 			Name:    "output",
 			Aliases: []string{"o"},
 			Usage:   "Output format, One of: json|yaml|table",
-			Value:   "table",
+			Value:   outputTypeTable,
 		},
 		&cli.BoolFlag{
 			Name:    "all",
@@ -489,154 +675,218 @@ var listContainersCommand = &cli.Command{
 			Name:  "no-trunc",
 			Usage: "Show output without truncating the ID",
 		},
+		&cli.BoolFlag{
+			Name:    "resolve-image-path",
+			Aliases: []string{"r"},
+			Usage:   "Show image path instead of image id",
+		},
+		&cli.StringFlag{
+			Name:  "namespace",
+			Usage: "Filter by pod namespace regular expression pattern",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
-		if err != nil {
-			return err
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 0 {
+			return cli.ShowSubcommandHelp(c)
 		}
-		defer closeConnection(context, runtimeConn)
 
-		imageClient, imageConn, err := getImageClient(context)
-		if err != nil {
-			return err
-		}
-		defer closeConnection(context, imageConn)
+		cfg := configFromContext(c)
 
-		opts := listOptions{
-			id:         context.String("id"),
-			podID:      context.String("pod"),
-			state:      context.String("state"),
-			verbose:    context.Bool("verbose"),
-			quiet:      context.Bool("quiet"),
-			output:     context.String("output"),
-			all:        context.Bool("all"),
-			nameRegexp: context.String("name"),
-			latest:     context.Bool("latest"),
-			last:       context.Int("last"),
-			noTrunc:    context.Bool("no-trunc"),
-			image:      context.String("image"),
-		}
-		opts.labels, err = parseLabelStringSlice(context.StringSlice("label"))
+		runtimeClient, err := cfg.GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
 
-		if err = ListContainers(runtimeClient, imageClient, opts); err != nil {
-			return errors.Wrap(err, "listing containers")
+		imageClient, err := cfg.GetImageService(c.Context)
+		if err != nil {
+			return err
 		}
+
+		opts := &listOptions{
+			id:                 c.String("id"),
+			podID:              c.String("pod"),
+			podNamespaceRegexp: c.String("namespace"),
+			state:              c.String("state"),
+			verbose:            c.Bool("verbose"),
+			quiet:              c.Bool("quiet"),
+			output:             c.String("output"),
+			all:                c.Bool("all"),
+			nameRegexp:         c.String("name"),
+			latest:             c.Bool("latest"),
+			last:               c.Int("last"),
+			noTrunc:            c.Bool("no-trunc"),
+			image:              c.String("image"),
+			resolveImagePath:   c.Bool("resolve-image-path"),
+		}
+
+		opts.labels, err = parseLabelStringSlice(c.StringSlice("label"))
+		if err != nil {
+			return err
+		}
+
+		if err = OutputContainers(c.Context, runtimeClient, imageClient, opts); err != nil {
+			return fmt.Errorf("listing containers: %w", err)
+		}
+
 		return nil
 	},
 }
 
 var runContainerCommand = &cli.Command{
-	Name:      "run",
-	Usage:     "Run a new container inside a sandbox",
-	ArgsUsage: "container-config.[json|yaml] pod-config.[json|yaml]",
-	Flags: append(runPullFlags, &cli.StringFlag{
-		Name:    "runtime",
-		Aliases: []string{"r"},
-		Usage:   "Runtime handler to use. Available options are defined by the container runtime.",
-	}, &cli.DurationFlag{
-		Name:    "timeout",
-		Aliases: []string{"t"},
-		Usage:   "Seconds to wait for a container create request before cancelling the request",
-	}),
-
-	Action: func(context *cli.Context) error {
-		if context.Args().Len() != 2 {
-			return cli.ShowSubcommandHelp(context)
-		}
-		if context.Bool("no-pull") == true && context.Bool("with-pull") == true {
-			return errors.New("confict: no-pull and with-pull are both set")
+	Name:        "run",
+	Usage:       "Run a new container inside a sandbox",
+	ArgsUsage:   "container-config.[json|yaml] pod-config.[json|yaml]",
+	Flags:       runPullFlags,
+	Subcommands: subcommands,
+	Action: func(c *cli.Context) (err error) {
+		if c.Args().Len() != 2 {
+			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
-		if err != nil {
-			return err
+		if c.Bool("no-pull") && c.Bool("with-pull") {
+			return errors.New("conflict: no-pull and with-pull are both set")
 		}
-		defer closeConnection(context, runtimeConn)
 
-		withPull := (!DisablePullOnRun && !context.Bool("no-pull")) || context.Bool("with-pull")
+		cfg := configFromContext(c)
+		withPull := (!cfg.DisablePullOnRun && !c.Bool("no-pull")) || c.Bool("with-pull")
 
-		var (
-			imageClient pb.ImageServiceClient
-			imageConn   *grpc.ClientConn
-		)
-
+		var imageClient internalapi.ImageManagerService
 		if withPull {
-			imageClient, imageConn, err = getImageClient(context)
+			imageClient, err = cfg.GetImageService(c.Context)
 			if err != nil {
 				return err
 			}
-			defer closeConnection(context, imageConn)
 		}
 
 		opts := runOptions{
-			configPath: context.Args().Get(0),
-			podConfig:  context.Args().Get(1),
+			configPath: c.Args().Get(0),
+			podConfig:  c.Args().Get(1),
 			pullOptions: &pullOptions{
 				withPull: withPull,
-				creds:    context.String("creds"),
-				auth:     context.String("auth"),
+				creds:    c.String("creds"),
+				auth:     c.String("auth"),
+				username: c.String("username"),
+				timeout:  c.Duration("pull-timeout"),
 			},
-			timeout: context.Duration("timeout"),
+			timeout: c.Duration("cancel-timeout"),
 		}
 
-		err = RunContainer(imageClient, runtimeClient, opts, context.String("runtime"))
+		runtimeClient, err := cfg.GetRuntimeService(c.Context, opts.timeout)
 		if err != nil {
-			return errors.Wrap(err, "running container")
+			return err
 		}
+
+		if err = RunContainer(
+			c.Context,
+			imageClient,
+			runtimeClient,
+			opts,
+			c.String("runtime"),
+		); err != nil {
+			return fmt.Errorf("running container: %w", err)
+		}
+
 		return nil
 	},
 }
 
-// RunContainer starts a container in the provided sandbox
+var checkpointContainerCommand = &cli.Command{
+	Name:                   "checkpoint",
+	Usage:                  "Checkpoint one or more running containers",
+	ArgsUsage:              "CONTAINER-ID [CONTAINER-ID...]",
+	UseShortOptionHandling: true,
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:    "export",
+			Aliases: []string{"e"},
+			Usage:   "Specify the name of the tar archive (/path/to/checkpoint.tar) used to export the checkpoint image.",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if c.NArg() == 0 {
+			return errIDEmpty
+		}
+
+		if c.String("export") == "" {
+			return errors.New(
+				"cannot checkpoint a container without specifying the checkpoint destination. " +
+					"Use --export=/path/to/checkpoint.tar",
+			)
+		}
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
+		if err != nil {
+			return err
+		}
+
+		for i := range c.NArg() {
+			containerID := c.Args().Get(i)
+
+			err := CheckpointContainer(
+				c.Context,
+				runtimeClient,
+				containerID,
+				c.String("export"),
+			)
+			if err != nil {
+				return fmt.Errorf("checkpointing the container %q failed: %w", containerID, err)
+			}
+		}
+
+		return nil
+	},
+}
+
+// RunContainer starts a container in the provided sandbox.
 func RunContainer(
-	iClient pb.ImageServiceClient,
-	rClient pb.RuntimeServiceClient,
+	ctx context.Context,
+	iClient internalapi.ImageManagerService,
+	rClient internalapi.RuntimeService,
 	opts runOptions,
 	runtime string,
 ) error {
 	// Create the pod
 	podSandboxConfig, err := loadPodSandboxConfig(opts.podConfig)
 	if err != nil {
-		return errors.Wrap(err, "load podSandboxConfig")
+		return fmt.Errorf("load podSandboxConfig: %w", err)
 	}
 	// set the timeout for the RunPodSandbox request to 0, because the
 	// timeout option is documented as being for container creation.
-	podID, err := RunPodSandbox(rClient, podSandboxConfig, runtime, 0)
+	podID, err := RunPodSandbox(ctx, rClient, podSandboxConfig, runtime)
 	if err != nil {
-		return errors.Wrap(err, "run pod sandbox")
+		return fmt.Errorf("run pod sandbox: %w", err)
 	}
 
 	// Create the container
-	containerOptions := createOptions{podID, &opts}
-	ctrID, err := CreateContainer(iClient, rClient, containerOptions)
+	containerOptions := createOptions{&opts, podID}
+
+	ctrID, err := CreateContainer(ctx, iClient, rClient, containerOptions)
 	if err != nil {
-		return errors.Wrap(err, "creating container failed")
+		return fmt.Errorf("creating container failed: %w", err)
 	}
 
 	// Start the container
-	err = StartContainer(rClient, ctrID)
+	err = StartContainer(ctx, rClient, ctrID)
 	if err != nil {
-		return errors.Wrapf(err, "starting the container %q", ctrID)
+		return fmt.Errorf("starting the container %q: %w", ctrID, err)
 	}
+
 	return nil
 }
 
 // CreateContainer sends a CreateContainerRequest to the server, and parses
 // the returned CreateContainerResponse.
 func CreateContainer(
-	iClient pb.ImageServiceClient,
-	rClient pb.RuntimeServiceClient,
+	ctx context.Context,
+	iClient internalapi.ImageManagerService,
+	rClient internalapi.RuntimeService,
 	opts createOptions,
 ) (string, error) {
-
 	config, err := loadContainerConfig(opts.configPath)
 	if err != nil {
 		return "", err
 	}
+
 	var podConfig *pb.PodSandboxConfig
 	if opts.podConfig != "" {
 		podConfig, err = loadPodSandboxConfig(opts.podConfig)
@@ -645,21 +895,50 @@ func CreateContainer(
 		}
 	}
 
+	image := config.GetImage().GetImage()
+	if config.GetImage().GetUserSpecifiedImage() == "" {
+		config.Image.UserSpecifiedImage = image
+	}
+
 	// When there is a with-pull request or the image default mode is to
 	// pull-image-on-create(true) and no-pull was not set we pull the image when
 	// they ask for a create as a helper on the cli to reduce extra steps. As a
 	// reminder if the image is already in cache only the manifest will be pulled
 	// down to verify.
 	if opts.withPull {
-		auth, err := getAuth(opts.creds, opts.auth)
+		auth, err := getAuth(opts.creds, opts.auth, opts.username)
 		if err != nil {
 			return "", err
 		}
 
 		// Try to pull the image before container creation
-		image := config.GetImage().GetImage()
-		if _, err := PullImageWithSandbox(iClient, image, auth, podConfig); err != nil {
-			return "", err
+		images := []string{image}
+		logrus.Infof("Pulling container image: %s", image)
+
+		// Add possible OCI volume mounts
+		for _, m := range config.GetMounts() {
+			if m.GetImage() != nil && m.GetImage().GetImage() != "" {
+				logrus.Infof(
+					"Pulling image %s to be mounted to container path: %s",
+					m.GetImage().GetImage(),
+					m.GetContainerPath(),
+				)
+				images = append(images, m.GetImage().GetImage())
+			}
+		}
+
+		for _, image := range images {
+			if _, err := PullImageWithSandbox(
+				ctx,
+				iClient,
+				image,
+				auth,
+				podConfig,
+				config.GetImage().GetAnnotations(),
+				opts.pullOptions.timeout,
+			); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -669,36 +948,42 @@ func CreateContainer(
 		SandboxConfig: podConfig,
 	}
 	logrus.Debugf("CreateContainerRequest: %v", request)
-	ctx, cancel := ctxWithTimeout(opts.timeout)
-	defer cancel()
-	r, err := rClient.CreateContainer(ctx, request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) (string, error) {
+		return rClient.CreateContainer(ctx, opts.podID, config, podConfig)
+	})
 	logrus.Debugf("CreateContainerResponse: %v", r)
+
 	if err != nil {
 		return "", err
 	}
-	return r.ContainerId, nil
+
+	return r, nil
 }
 
 // StartContainer sends a StartContainerRequest to the server, and parses
 // the returned StartContainerResponse.
-func StartContainer(client pb.RuntimeServiceClient, ID string) error {
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
+func StartContainer(ctx context.Context, client internalapi.RuntimeService, id string) error {
+	if id == "" {
+		return errIDEmpty
 	}
-	request := &pb.StartContainerRequest{
-		ContainerId: ID,
-	}
-	logrus.Debugf("StartContainerRequest: %v", request)
-	r, err := client.StartContainer(context.Background(), request)
-	logrus.Debugf("StartContainerResponse: %v", r)
-	if err != nil {
+
+	if _, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, client.StartContainer(ctx, id)
+	}); err != nil {
 		return err
 	}
-	fmt.Println(ID)
+
+	fmt.Println(id)
+
 	return nil
 }
 
 type updateOptions struct {
+	// (Windows only) Number of CPUs available to the container.
+	CPUCount int64
+	// (Windows only) Portion of CPU cycles specified as a percentage * 100.
+	CPUMaximum int64
 	// CPU CFS (Completely Fair Scheduler) period. Default: 0 (not specified).
 	CPUPeriod int64
 	// CPU CFS (Completely Fair Scheduler) quota. Default: 0 (not specified).
@@ -717,13 +1002,21 @@ type updateOptions struct {
 
 // UpdateContainerResources sends an UpdateContainerResourcesRequest to the server, and parses
 // the returned UpdateContainerResourcesResponse.
-func UpdateContainerResources(client pb.RuntimeServiceClient, ID string, opts updateOptions) error {
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
+func UpdateContainerResources(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	id string,
+	opts *updateOptions,
+) error {
+	if id == "" {
+		return errIDEmpty
 	}
+
 	request := &pb.UpdateContainerResourcesRequest{
-		ContainerId: ID,
-		Linux: &pb.LinuxContainerResources{
+		ContainerId: id,
+	}
+	if goruntime.GOOS != framework.OSWindows {
+		request.Linux = &pb.LinuxContainerResources{
 			CpuPeriod:          opts.CPUPeriod,
 			CpuQuota:           opts.CPUQuota,
 			CpuShares:          opts.CPUShares,
@@ -731,54 +1024,101 @@ func UpdateContainerResources(client pb.RuntimeServiceClient, ID string, opts up
 			CpusetMems:         opts.CpusetMems,
 			MemoryLimitInBytes: opts.MemoryLimitInBytes,
 			OomScoreAdj:        opts.OomScoreAdj,
-		},
+		}
+	} else {
+		request.Windows = &pb.WindowsContainerResources{
+			CpuCount:           opts.CPUCount,
+			CpuMaximum:         opts.CPUMaximum,
+			CpuShares:          opts.CPUShares,
+			MemoryLimitInBytes: opts.MemoryLimitInBytes,
+		}
 	}
+
 	logrus.Debugf("UpdateContainerResourcesRequest: %v", request)
-	r, err := client.UpdateContainerResources(context.Background(), request)
-	logrus.Debugf("UpdateContainerResourcesResponse: %v", r)
-	if err != nil {
+	resources := &pb.ContainerResources{Linux: request.GetLinux(), Windows: request.GetWindows()}
+
+	if _, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, client.UpdateContainerResources(ctx, id, resources)
+	}); err != nil {
 		return err
 	}
-	fmt.Println(ID)
+
+	fmt.Println(id)
+
 	return nil
 }
 
 // StopContainer sends a StopContainerRequest to the server, and parses
 // the returned StopContainerResponse.
-func StopContainer(client pb.RuntimeServiceClient, ID string, timeout int64) error {
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
+func StopContainer(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	id string,
+	timeout int64,
+) error {
+	if id == "" {
+		return errIDEmpty
 	}
-	request := &pb.StopContainerRequest{
-		ContainerId: ID,
-		Timeout:     timeout,
+
+	logrus.Debugf("Stopping container: %s (timeout = %v)", id, timeout)
+
+	if _, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, client.StopContainer(ctx, id, timeout)
+	}); err != nil {
+		return err
 	}
-	logrus.Debugf("StopContainerRequest: %v", request)
-	r, err := client.StopContainer(context.Background(), request)
-	logrus.Debugf("StopContainerResponse: %v", r)
+
+	fmt.Println(id)
+
+	return nil
+}
+
+// CheckpointContainer sends a CheckpointContainerRequest to the server.
+func CheckpointContainer(
+	ctx context.Context,
+	rClient internalapi.RuntimeService,
+	id string,
+	export string,
+) error {
+	if id == "" {
+		return errIDEmpty
+	}
+
+	request := &pb.CheckpointContainerRequest{
+		ContainerId: id,
+		Location:    export,
+	}
+	logrus.Debugf("CheckpointContainerRequest: %v", request)
+
+	_, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, rClient.CheckpointContainer(ctx, request)
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Println(ID)
+
+	fmt.Println(id)
+
 	return nil
 }
 
 // RemoveContainer sends a RemoveContainerRequest to the server, and parses
 // the returned RemoveContainerResponse.
-func RemoveContainer(client pb.RuntimeServiceClient, ID string) error {
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
+func RemoveContainer(ctx context.Context, client internalapi.RuntimeService, id string) error {
+	if id == "" {
+		return errIDEmpty
 	}
-	request := &pb.RemoveContainerRequest{
-		ContainerId: ID,
-	}
-	logrus.Debugf("RemoveContainerRequest: %v", request)
-	r, err := client.RemoveContainer(context.Background(), request)
-	logrus.Debugf("RemoveContainerResponse: %v", r)
-	if err != nil {
+
+	logrus.Debugf("Removing container: %s", id)
+
+	if _, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, client.RemoveContainer(ctx, id)
+	}); err != nil {
 		return err
 	}
-	fmt.Println(ID)
+
+	fmt.Println(id)
+
 	return nil
 }
 
@@ -789,124 +1129,150 @@ func marshalContainerStatus(cs *pb.ContainerStatus) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	jsonMap := make(map[string]interface{})
+
+	jsonMap := make(map[string]any)
+
 	err = json.Unmarshal([]byte(statusStr), &jsonMap)
 	if err != nil {
 		return "", err
 	}
 
-	jsonMap["createdAt"] = time.Unix(0, cs.CreatedAt).Format(time.RFC3339Nano)
+	jsonMap["createdAt"] = time.Unix(0, cs.GetCreatedAt()).Format(time.RFC3339Nano)
+
 	var startedAt, finishedAt time.Time
-	if cs.State != pb.ContainerState_CONTAINER_CREATED {
+	if cs.GetState() != pb.ContainerState_CONTAINER_CREATED {
 		// If container is not in the created state, we have tried and
 		// started the container. Set the startedAt.
-		startedAt = time.Unix(0, cs.StartedAt)
+		startedAt = time.Unix(0, cs.GetStartedAt())
 	}
-	if cs.State == pb.ContainerState_CONTAINER_EXITED ||
-		(cs.State == pb.ContainerState_CONTAINER_UNKNOWN && cs.FinishedAt > 0) {
+
+	if cs.GetState() == pb.ContainerState_CONTAINER_EXITED ||
+		(cs.GetState() == pb.ContainerState_CONTAINER_UNKNOWN && cs.GetFinishedAt() > 0) {
 		// If container is in the exit state, set the finishedAt.
 		// Or if container is in the unknown state and FinishedAt > 0, set the finishedAt
-		finishedAt = time.Unix(0, cs.FinishedAt)
+		finishedAt = time.Unix(0, cs.GetFinishedAt())
 	}
+
 	jsonMap["startedAt"] = startedAt.Format(time.RFC3339Nano)
 	jsonMap["finishedAt"] = finishedAt.Format(time.RFC3339Nano)
-	return marshalMapInOrder(jsonMap, *cs)
+
+	return marshalMapInOrder(jsonMap, cs)
 }
 
-// ContainerStatus sends a ContainerStatusRequest to the server, and parses
+// containerStatus sends a ContainerStatusRequest to the server, and parses
 // the returned ContainerStatusResponse.
-func ContainerStatus(client pb.RuntimeServiceClient, ID, output string, tmplStr string, quiet bool) error {
-	verbose := !(quiet)
-	if output == "" { // default to json output
-		output = "json"
-	}
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
-	}
-	request := &pb.ContainerStatusRequest{
-		ContainerId: ID,
-		Verbose:     verbose,
-	}
-	logrus.Debugf("ContainerStatusRequest: %v", request)
-	r, err := client.ContainerStatus(context.Background(), request)
-	logrus.Debugf("ContainerStatusResponse: %v", r)
-	if err != nil {
-		return err
-	}
+func containerStatus(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	ids []string,
+	output, tmplStr string,
+	quiet bool,
+) error {
+	return resourceStatus(
+		ctx, ids, output, tmplStr, quiet,
+		func(ctx context.Context, id string, verbose bool) (*pb.ContainerStatusResponse, error) {
+			r, err := InterruptableRPC(
+				ctx,
+				func(ctx context.Context) (*pb.ContainerStatusResponse, error) {
+					return client.ContainerStatus(ctx, id, verbose)
+				},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("get container status: %w", err)
+			}
 
-	status, err := marshalContainerStatus(r.Status)
-	if err != nil {
-		return err
-	}
+			return r, nil
+		},
+		func(r *pb.ContainerStatusResponse) (string, error) {
+			s, err := marshalContainerStatus(r.GetStatus())
+			if err != nil {
+				return "", fmt.Errorf("marshal container status: %w", err)
+			}
 
-	switch output {
-	case "json", "yaml", "go-template":
-		return outputStatusInfo(status, r.Info, output, tmplStr)
-	case "table": // table output is after this switch block
-	default:
-		return fmt.Errorf("output option cannot be %s", output)
-	}
+			return s, nil
+		},
+		outputContainerStatusTable,
+	)
+}
 
-	// output in table format
-	fmt.Printf("ID: %s\n", r.Status.Id)
-	if r.Status.Metadata != nil {
-		if r.Status.Metadata.Name != "" {
-			fmt.Printf("Name: %s\n", r.Status.Metadata.Name)
+func outputContainerStatusTable(r *pb.ContainerStatusResponse, verbose bool) {
+	fmt.Printf("ID: %s\n", r.GetStatus().GetId())
+
+	if r.GetStatus().GetMetadata() != nil {
+		if r.GetStatus().GetMetadata().GetName() != "" {
+			fmt.Printf("Name: %s\n", r.GetStatus().GetMetadata().GetName())
 		}
-		if r.Status.Metadata.Attempt != 0 {
-			fmt.Printf("Attempt: %v\n", r.Status.Metadata.Attempt)
+
+		if r.GetStatus().GetMetadata().GetAttempt() != 0 {
+			fmt.Printf("Attempt: %v\n", r.GetStatus().GetMetadata().GetAttempt())
 		}
 	}
-	fmt.Printf("State: %s\n", r.Status.State)
-	ctm := time.Unix(0, r.Status.CreatedAt)
+
+	fmt.Printf("State: %s\n", r.GetStatus().GetState())
+	ctm := time.Unix(0, r.GetStatus().GetCreatedAt())
 	fmt.Printf("Created: %v\n", units.HumanDuration(time.Now().UTC().Sub(ctm))+" ago")
-	if r.Status.State != pb.ContainerState_CONTAINER_CREATED {
-		stm := time.Unix(0, r.Status.StartedAt)
+
+	if r.GetStatus().GetState() != pb.ContainerState_CONTAINER_CREATED {
+		stm := time.Unix(0, r.GetStatus().GetStartedAt())
 		fmt.Printf("Started: %v\n", units.HumanDuration(time.Now().UTC().Sub(stm))+" ago")
 	}
-	if r.Status.State == pb.ContainerState_CONTAINER_EXITED {
-		if r.Status.FinishedAt > 0 {
-			ftm := time.Unix(0, r.Status.FinishedAt)
+
+	if r.GetStatus().GetState() == pb.ContainerState_CONTAINER_EXITED {
+		if r.GetStatus().GetFinishedAt() > 0 {
+			ftm := time.Unix(0, r.GetStatus().GetFinishedAt())
 			fmt.Printf("Finished: %v\n", units.HumanDuration(time.Now().UTC().Sub(ftm))+" ago")
 		}
-		fmt.Printf("Exit Code: %v\n", r.Status.ExitCode)
+
+		fmt.Printf("Exit Code: %v\n", r.GetStatus().GetExitCode())
 	}
+
 	if r.Status.Labels != nil {
 		fmt.Println("Labels:")
-		for _, k := range getSortedKeys(r.Status.Labels) {
-			fmt.Printf("\t%s -> %s\n", k, r.Status.Labels[k])
+
+		for _, k := range getSortedKeys(r.GetStatus().GetLabels()) {
+			fmt.Printf("\t%s -> %s\n", k, r.GetStatus().GetLabels()[k])
 		}
 	}
+
 	if r.Status.Annotations != nil {
 		fmt.Println("Annotations:")
-		for _, k := range getSortedKeys(r.Status.Annotations) {
-			fmt.Printf("\t%s -> %s\n", k, r.Status.Annotations[k])
+
+		for _, k := range getSortedKeys(r.GetStatus().GetAnnotations()) {
+			fmt.Printf("\t%s -> %s\n", k, r.GetStatus().GetAnnotations()[k])
 		}
 	}
+
 	if verbose {
 		fmt.Printf("Info: %v\n", r.GetInfo())
 	}
-
-	return nil
 }
 
 // ListContainers sends a ListContainerRequest to the server, and parses
 // the returned ListContainerResponse.
-func ListContainers(runtimeClient pb.RuntimeServiceClient, imageClient pb.ImageServiceClient, opts listOptions) error {
+func ListContainers(
+	ctx context.Context,
+	runtimeClient internalapi.RuntimeService,
+	imageClient internalapi.ImageManagerService,
+	opts *listOptions,
+) ([]*pb.Container, error) {
 	filter := &pb.ContainerFilter{}
 	if opts.id != "" {
 		filter.Id = opts.id
 	}
+
 	if opts.podID != "" {
 		filter.PodSandboxId = opts.podID
 	}
+
 	st := &pb.ContainerStateValue{}
 	if !opts.all && opts.state == "" {
 		st.State = pb.ContainerState_CONTAINER_RUNNING
 		filter.State = st
 	}
+
 	if opts.state != "" {
 		st.State = pb.ContainerState_CONTAINER_UNKNOWN
+
 		switch strings.ToLower(opts.state) {
 		case "created":
 			st.State = pb.ContainerState_CONTAINER_CREATED
@@ -921,143 +1287,258 @@ func ListContainers(runtimeClient pb.RuntimeServiceClient, imageClient pb.ImageS
 			st.State = pb.ContainerState_CONTAINER_UNKNOWN
 			filter.State = st
 		default:
-			log.Fatalf("--state should be one of created, running, exited or unknown")
+			return nil, errors.New("--state should be one of created, running, exited or unknown")
 		}
 	}
+
 	if opts.latest || opts.last > 0 {
 		// Do not filter by state if latest/last is specified.
 		filter.State = nil
 	}
+
 	if opts.labels != nil {
 		filter.LabelSelector = opts.labels
 	}
-	request := &pb.ListContainersRequest{
-		Filter: filter,
-	}
-	logrus.Debugf("ListContainerRequest: %v", request)
-	r, err := runtimeClient.ListContainers(context.Background(), request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) ([]*pb.Container, error) {
+		return runtimeClient.ListContainers(ctx, filter)
+	})
 	logrus.Debugf("ListContainerResponse: %v", r)
+
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("call list containers RPC: %w", err)
 	}
-	r.Containers = getContainersList(r.GetContainers(), opts)
+
+	return getContainersList(ctx, imageClient, r, opts)
+}
+
+// OutputContainers sends a ListContainerRequest to the server, and parses
+// the returned ListContainerResponse for output.
+func OutputContainers(
+	ctx context.Context,
+	runtimeClient internalapi.RuntimeService,
+	imageClient internalapi.ImageManagerService,
+	opts *listOptions,
+) error {
+	r, err := ListContainers(ctx, runtimeClient, imageClient, opts)
+	if err != nil {
+		return fmt.Errorf("list containers: %w", err)
+	}
 
 	switch opts.output {
-	case "json":
-		return outputProtobufObjAsJSON(r)
-	case "yaml":
-		return outputProtobufObjAsYAML(r)
-	case "table":
+	case outputTypeJSON:
+		return outputProtobufObjAsJSON(&pb.ListContainersResponse{Containers: r})
+	case outputTypeYAML:
+		return outputProtobufObjAsYAML(&pb.ListContainersResponse{Containers: r})
+	case outputTypeTable:
 	// continue; output will be generated after the switch block ends.
 	default:
 		return fmt.Errorf("unsupported output format %q", opts.output)
 	}
 
-	display := newTableDisplay(20, 1, 3, ' ', 0)
+	display := newDefaultTableDisplay()
 	if !opts.verbose && !opts.quiet {
-		display.AddRow([]string{columnContainer, columnImage, columnCreated, columnState, columnName, columnAttempt, columnPodID})
+		display.AddRow(
+			[]string{
+				columnContainer,
+				columnImage,
+				columnCreated,
+				columnState,
+				columnName,
+				columnAttempt,
+				columnPodID,
+				columnPodName,
+				columnNamespace,
+			},
+		)
 	}
-	for _, c := range r.Containers {
-		if match, err := matchesImage(imageClient, opts.image, c.GetImage().GetImage()); err != nil {
-			return errors.Wrap(err, "check image match")
-		} else if !match {
-			continue
-		}
+
+	for _, c := range r {
 		if opts.quiet {
-			fmt.Printf("%s\n", c.Id)
+			fmt.Printf("%s\n", c.GetId())
+
 			continue
 		}
 
-		createdAt := time.Unix(0, c.CreatedAt)
+		createdAt := time.Unix(0, c.GetCreatedAt())
 		ctm := units.HumanDuration(time.Now().UTC().Sub(createdAt)) + " ago"
+		podNamespace := getPodNamespaceFromLabels(c.GetLabels())
+
 		if !opts.verbose {
-			id := c.Id
-			image := c.Image.Image
+			id := c.GetId()
+			podID := c.GetPodSandboxId()
+
+			var image string
+			if c.GetImage() != nil {
+				image = c.GetImage().GetImage()
+			}
+
 			if !opts.noTrunc {
 				id = getTruncatedID(id, "")
-
+				podID = getTruncatedID(podID, "")
 				// Now c.Image.Image is imageID in kubelet.
 				if digest, err := godigest.Parse(image); err == nil {
 					image = getTruncatedID(digest.String(), string(digest.Algorithm())+":")
 				}
 			}
-			PodID := getTruncatedID(c.PodSandboxId, "")
-			display.AddRow([]string{id, image, ctm, convertContainerState(c.State), c.Metadata.Name,
-				fmt.Sprintf("%d", c.Metadata.Attempt), PodID})
+
+			if opts.resolveImagePath {
+				orig, err := getRepoImage(ctx, imageClient, image)
+				if err != nil {
+					return fmt.Errorf("failed to fetch repo image %w", err)
+				}
+
+				image = orig
+			}
+
+			podName := getPodNameFromLabels(c.GetLabels())
+
+			containerState, err := convertContainerState(c.GetState())
+			if err != nil {
+				return err
+			}
+
+			display.AddRow([]string{
+				id,
+				image,
+				ctm,
+				containerState,
+				c.GetMetadata().GetName(),
+				strconv.FormatUint(
+					uint64(c.GetMetadata().GetAttempt()),
+					10,
+				),
+				podID,
+				podName,
+				podNamespace,
+			})
+
 			continue
 		}
 
-		fmt.Printf("ID: %s\n", c.Id)
-		fmt.Printf("PodID: %s\n", c.PodSandboxId)
-		if c.Metadata != nil {
-			if c.Metadata.Name != "" {
-				fmt.Printf("Name: %s\n", c.Metadata.Name)
+		fmt.Printf("ID: %s\n", c.GetId())
+		fmt.Printf("PodID: %s\n", c.GetPodSandboxId())
+		fmt.Printf("Namespace: %s\n", podNamespace)
+
+		if c.GetMetadata() != nil {
+			if c.GetMetadata().GetName() != "" {
+				fmt.Printf("Name: %s\n", c.GetMetadata().GetName())
 			}
-			fmt.Printf("Attempt: %v\n", c.Metadata.Attempt)
+
+			fmt.Printf("Attempt: %v\n", c.GetMetadata().GetAttempt())
 		}
-		fmt.Printf("State: %s\n", convertContainerState(c.State))
-		if c.Image != nil {
-			fmt.Printf("Image: %s\n", c.Image.Image)
+
+		containerState, err := convertContainerState(c.GetState())
+		if err != nil {
+			return err
 		}
+
+		fmt.Printf("State: %s\n", containerState)
+
+		if c.GetImage() != nil {
+			fmt.Printf("Image: %s\n", c.GetImage().GetImage())
+		}
+
 		fmt.Printf("Created: %v\n", ctm)
+
 		if c.Labels != nil {
 			fmt.Println("Labels:")
-			for _, k := range getSortedKeys(c.Labels) {
-				fmt.Printf("\t%s -> %s\n", k, c.Labels[k])
+
+			for _, k := range getSortedKeys(c.GetLabels()) {
+				fmt.Printf("\t%s -> %s\n", k, c.GetLabels()[k])
 			}
 		}
+
 		if c.Annotations != nil {
 			fmt.Println("Annotations:")
-			for _, k := range getSortedKeys(c.Annotations) {
-				fmt.Printf("\t%s -> %s\n", k, c.Annotations[k])
+
+			for _, k := range getSortedKeys(c.GetAnnotations()) {
+				fmt.Printf("\t%s -> %s\n", k, c.GetAnnotations()[k])
 			}
 		}
+
 		fmt.Println()
 	}
 
 	display.Flush()
+
 	return nil
 }
 
-func convertContainerState(state pb.ContainerState) string {
+func convertContainerState(state pb.ContainerState) (string, error) {
 	switch state {
 	case pb.ContainerState_CONTAINER_CREATED:
-		return "Created"
+		return "Created", nil
 	case pb.ContainerState_CONTAINER_RUNNING:
-		return "Running"
+		return "Running", nil
 	case pb.ContainerState_CONTAINER_EXITED:
-		return "Exited"
+		return "Exited", nil
 	case pb.ContainerState_CONTAINER_UNKNOWN:
-		return "Unknown"
+		return "Unknown", nil
 	default:
-		log.Fatalf("Unknown container state %q", state)
-		return ""
+		return "", fmt.Errorf("unknown container state %q", state)
 	}
 }
 
-func getContainersList(containersList []*pb.Container, opts listOptions) []*pb.Container {
+func getPodNameFromLabels(labels map[string]string) string {
+	return getFromLabels(labels, types.KubernetesPodNameLabel)
+}
+
+func getPodNamespaceFromLabels(labels map[string]string) string {
+	return getFromLabels(labels, types.KubernetesPodNamespaceLabel)
+}
+
+func getFromLabels(labels map[string]string, label string) string {
+	value, ok := labels[label]
+	if ok {
+		return value
+	}
+
+	return "unknown"
+}
+
+func getContainersList(
+	ctx context.Context,
+	imageClient internalapi.ImageManagerService,
+	containersList []*pb.Container,
+	opts *listOptions,
+) ([]*pb.Container, error) {
+	nameRe, err := compileRegex(opts.nameRegexp)
+	if err != nil {
+		return nil, err
+	}
+
+	nsRe, err := compileRegex(opts.podNamespaceRegexp)
+	if err != nil {
+		return nil, err
+	}
+
 	filtered := []*pb.Container{}
+
 	for _, c := range containersList {
+		if match, err := matchesImage(
+			ctx,
+			imageClient,
+			opts.image,
+			c.GetImage().GetImage(),
+		); err != nil {
+			return nil, fmt.Errorf("check image match: %w", err)
+		} else if !match {
+			continue
+		}
+
+		podNamespace := getPodNamespaceFromLabels(c.GetLabels())
 		// Filter by pod name/namespace regular expressions.
-		if matchesRegex(opts.nameRegexp, c.Metadata.Name) {
+		if c.GetMetadata() != nil &&
+			matchesRegex(nameRe, c.GetMetadata().GetName()) &&
+			matchesRegex(nsRe, podNamespace) {
 			filtered = append(filtered, c)
 		}
 	}
 
-	sort.Sort(containerByCreated(filtered))
-	n := len(filtered)
-	if opts.latest {
-		n = 1
-	}
-	if opts.last > 0 {
-		n = opts.last
-	}
-	n = func(a, b int) int {
-		if a < b {
-			return a
-		}
-		return b
-	}(n, len(filtered))
+	slices.SortFunc(filtered, func(a, b *pb.Container) int {
+		return cmp.Compare(b.GetCreatedAt(), a.GetCreatedAt()) // descending
+	})
 
-	return filtered[:n]
+	return filtered[:truncateCount(len(filtered), opts.latest, opts.last)], nil
 }

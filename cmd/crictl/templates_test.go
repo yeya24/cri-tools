@@ -21,6 +21,8 @@ import (
 )
 
 func TestTmplExecuteRawJSON(t *testing.T) {
+	t.Parallel()
+
 	testcases := []struct {
 		rawJSON  string
 		tmplStr  string

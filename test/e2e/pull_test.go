@@ -17,54 +17,58 @@ limitations under the License.
 package e2e
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega/gexec"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
 )
 
-// The actual test suite
+// The actual test suite.
 var _ = t.Describe("pull", func() {
-	var (
-		endpoint, testDir string
-		crio              *Session
-	)
-	BeforeEach(func() {
-		endpoint, testDir, crio = t.StartCrio()
-	})
-
-	AfterEach(func() {
-		t.StopCrio(testDir, crio)
-	})
-
 	const (
 		imageSuccessText = "Image is up to date"
 		registry         = "gcr.io/k8s-staging-cri-tools/"
+
+		image1 = registry + "test-image-1"
+		image2 = registry + "test-image-1:latest"
+		image3 = registry + "test-image-digest@sha256:9700f9a2f5bf2c45f2f605a0bd3bce7cf37420ec9d3ed50ac2758413308766bf"
 	)
 
+	AfterEach(func() {
+		// Remove images by tag/digest first
+		t.Crictl("rmi " + strings.Join([]string{image1, image2, image3}, " "))
+
+		// Remove any remaining digest references for test-image-1
+		// Note: image1 and image2 both refer to test-image-1
+		res := t.Crictl("images --filter reference=" + image1 + " -q")
+
+		contents := res.Out.Contents()
+		if len(contents) > 0 {
+			output := strings.Split(string(contents), "\n")
+			t.Crictl("rmi " + strings.TrimSpace(strings.Join(output, " ")))
+		}
+	})
+
 	It("should succeed without tag or digest", func() {
-		t.CrictlExpectSuccessWithEndpoint(endpoint,
-			"pull "+registry+"test-image-1",
-			imageSuccessText)
+		t.CrictlExpectSuccess("pull "+image1, imageSuccessText)
 	})
 
 	It("should succeed with tag", func() {
-		t.CrictlExpectSuccessWithEndpoint(endpoint,
-			"pull "+registry+"test-image-1:latest",
-			imageSuccessText)
+		t.CrictlExpectSuccess("pull "+image2, imageSuccessText)
 	})
 
 	It("should succeed with digest", func() {
-		t.CrictlExpectSuccessWithEndpoint(endpoint,
-			"pull "+registry+"test-image-digest"+
-				"@sha256:9700f9a2f5bf2c45f2f605a0bd3bce7cf37420ec9d3ed50ac2758413308766bf",
-			imageSuccessText)
+		t.CrictlExpectSuccess("pull "+image3, imageSuccessText)
 	})
 
 	It("should succeed to show the help", func() {
 		t.CrictlExpectSuccess("pull -h", "Pull an image")
 	})
 
+	It("should succeed to generate the JSON schema", func() {
+		t.CrictlExpectSuccess("pull jsonschema", "PodSandboxConfig")
+	})
+
 	It("should fail on not existing image", func() {
-		t.CrictlExpectFailureWithEndpoint(endpoint, "pull localhost/wrong",
-			"", "pulling image")
+		t.CrictlExpectFailure("pull localhost/wrong", "", "pulling image")
 	})
 })

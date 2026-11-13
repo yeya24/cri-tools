@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows && !freebsd
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -18,8 +18,19 @@ limitations under the License.
 
 package main
 
+import (
+	"os"
+	"syscall"
+)
+
 const (
 	defaultConfigPath = "/etc/crictl.yaml"
 )
 
-var defaultRuntimeEndpoints = []string{"unix:///var/run/dockershim.sock", "unix:///run/containerd/containerd.sock", "unix:///run/crio/crio.sock"}
+var defaultRuntimeEndpoints = []string{
+	"unix:///run/containerd/containerd.sock",
+	"unix:///run/crio/crio.sock",
+	"unix:///var/run/cri-dockerd.sock",
+}
+
+var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}

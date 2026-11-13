@@ -17,30 +17,40 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/url"
+	"time"
 
-	dockerterm "github.com/docker/docker/pkg/term"
-	"github.com/pkg/errors"
+	mobyterm "github.com/moby/term"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/rest"
 	remoteclient "k8s.io/client-go/tools/remotecommand"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/kubectl/pkg/util/term"
+
+	"sigs.k8s.io/cri-tools/pkg/common"
 )
 
 const (
 	// TODO: make this configurable in kubelet.
 	kubeletURLSchema = "http"
 	kubeletURLHost   = "http://127.0.0.1:10250"
+
+	transportFlag = "transport"
+
+	detachSequence = "ctrl-p,ctrl-q"
 )
 
 var runtimeExecCommand = &cli.Command{
-	Name:                   "exec",
-	Usage:                  "Run a command in a running container",
-	ArgsUsage:              "CONTAINER-ID COMMAND [ARG...]",
+	Name:      "exec",
+	Usage:     "Run a command in a running container",
+	ArgsUsage: "[CONTAINER-ID] COMMAND [ARG...]",
+	Description: `The CONTAINER-ID is only required if none of the following filter flags are set:
+--image, --label, --last, --latest, --name, --pod, --state`,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
 		&cli.BoolFlag{
@@ -50,7 +60,6 @@ var runtimeExecCommand = &cli.Command{
 		},
 		&cli.Int64Flag{
 			Name:  "timeout",
-			Value: 0,
 			Usage: "Timeout in seconds",
 		},
 		&cli.BoolFlag{
@@ -63,65 +72,294 @@ var runtimeExecCommand = &cli.Command{
 			Aliases: []string{"i"},
 			Usage:   "Keep STDIN open",
 		},
+		&cli.StringFlag{
+			Name:    transportFlag,
+			Aliases: []string{"r"},
+			Value:   common.TransportSpdy,
+			Usage: fmt.Sprintf(
+				"Transport protocol to use, one of: %s|%s",
+				common.TransportSpdy,
+				common.TransportWebsocket,
+			),
+		},
+		&cli.StringFlag{
+			Name:  "name",
+			Usage: "Exec command for all containers matching this name filter regular expression pattern",
+		},
+		&cli.StringFlag{
+			Name:    "pod",
+			Aliases: []string{"p"},
+			Usage:   "Exec command for all containers matching this pod ID filter",
+		},
+		&cli.StringFlag{
+			Name:  "image",
+			Usage: "Exec command for all containers matching this container image filter",
+		},
+		&cli.StringFlag{
+			Name:  "state",
+			Usage: "Exec command for all containers matching this container state filter",
+		},
+		&cli.StringSliceFlag{
+			Name:  "label",
+			Usage: "Exec command for all containers matching this key=value label filter",
+		},
+		&cli.BoolFlag{
+			Name:    "latest",
+			Aliases: []string{"l"},
+			Usage:   "Exec command for the most recently created container",
+		},
+		&cli.IntFlag{
+			Name:    "last",
+			Aliases: []string{"n"},
+			Usage:   "Exec command for all last n containers, set to 0 for unlimited",
+		},
+		&cli.BoolFlag{
+			Name:    "quiet",
+			Aliases: []string{"q"},
+			Usage:   "Do not print the container ID if multiple containers are selected",
+		},
+		&cli.BoolFlag{
+			Name:    "ignore-errors",
+			Aliases: []string{"e"},
+			Usage:   "Ignore errors during command execution",
+		},
+		&cli.BoolFlag{
+			Name:    "parallel",
+			Aliases: []string{"x"},
+			Usage:   "Run the command in parallel if multiple containers are selected",
+		},
+		&cli.StringFlag{
+			Name:    flagTLSSNI,
+			Usage:   "Server name used in the TLS client to check server certificates against",
+			Aliases: []string{"tls-server-name"},
+			Value:   "localhost",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSCA,
+			Usage: "Path to the streaming TLS CA certificate",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSCert,
+			Usage: "Path to the streaming TLS certificate",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSKey,
+			Usage: "Path to the streaming TLS key",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		if context.Args().Len() < 2 {
-			return cli.ShowSubcommandHelp(context)
+	Action: func(c *cli.Context) error {
+		if c.NArg() < 1 {
+			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, conn, err := getRuntimeClient(context)
+		cfg := configFromContext(c)
+
+		runtimeClient, err := cfg.GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, conn)
 
-		var opts = execOptions{
-			id:      context.Args().First(),
-			timeout: context.Int64("timeout"),
-			tty:     context.Bool("tty"),
-			stdin:   context.Bool("interactive"),
-			cmd:     context.Args().Slice()[1:],
+		imageClient, err := cfg.GetImageService(c.Context)
+		if err != nil {
+			return err
 		}
-		if context.Bool("sync") {
-			exitCode, err := ExecSync(runtimeClient, opts)
+
+		// Assume a regular exec where the first arg is the container ID.
+		ids := []string{c.Args().First()}
+		cmd := c.Args().Slice()[1:]
+		outputContainerID := false
+		ignoreErrors := c.Bool("ignore-errors")
+		quiet := c.Bool("quiet")
+
+		if ignoreErrors && !quiet {
+			logrus.Warn(
+				"The `--ignore-errors` option has been set all errors returned by the command will be ignored.",
+			)
+		}
+
+		// If any of the filter flags are set, then we assume that no
+		// CONTAINER-ID is provided as CLI parameter.
+		if c.IsSet("name") ||
+			c.IsSet("pod") ||
+			c.IsSet("image") ||
+			c.IsSet("state") ||
+			c.IsSet("label") ||
+			c.IsSet("latest") ||
+			c.IsSet("last") {
+			ids = []string{}
+			cmd = c.Args().Slice()
+			outputContainerID = !quiet && !c.Bool("parallel")
+
+			opts := &listOptions{
+				nameRegexp: c.String("name"),
+				podID:      c.String("pod"),
+				image:      c.String("image"),
+				state:      c.String("state"),
+				latest:     c.Bool("latest"),
+				last:       c.Int("last"),
+			}
+
+			opts.labels, err = parseLabelStringSlice(c.StringSlice("label"))
 			if err != nil {
-				return errors.Wrap(err, "execing command in container synchronously")
+				return err
 			}
-			if exitCode != 0 {
-				return cli.NewExitError("non-zero exit code", exitCode)
+
+			ctrs, err := ListContainers(c.Context, runtimeClient, imageClient, opts)
+			if err != nil {
+				return fmt.Errorf("listing containers: %w", err)
 			}
+
+			for _, ctr := range ctrs {
+				ids = append(ids, ctr.GetId())
+			}
+
+			if len(ids) == 0 {
+				logrus.Error("No containers found per filter flags")
+
+				return cli.ShowSubcommandHelp(c)
+			}
+		} else if c.NArg() < 2 {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		opts := execOptions{
+			timeout:   c.Int64("timeout"),
+			tty:       c.Bool("tty"),
+			stdin:     c.Bool("interactive"),
+			cmd:       cmd,
+			transport: c.String(transportFlag),
+		}
+
+		opts.tlsConfig, err = tlsConfigFromFlags(c)
+		if err != nil {
+			return fmt.Errorf("get TLS config from flags: %w", err)
+		}
+
+		funcs := []func() error{}
+		for _, id := range ids {
+			funcs = append(funcs, func() error {
+				optsCopy := &execOptions{
+					id:        id,
+					cmd:       opts.cmd,
+					stdin:     opts.stdin,
+					timeout:   opts.timeout,
+					tlsConfig: opts.tlsConfig,
+					transport: opts.transport,
+					tty:       opts.tty,
+				}
+
+				if outputContainerID {
+					fmt.Println(id + ":")
+				}
+
+				if c.Bool("sync") {
+					exitCode, err := ExecSync(c.Context, runtimeClient, optsCopy)
+					if err != nil {
+						return fmt.Errorf(
+							"execing command in container %s synchronously: %w",
+							id,
+							err,
+						)
+					}
+
+					if exitCode != 0 {
+						return cli.Exit("non-zero exit code", exitCode)
+					}
+				} else {
+					ctx, cancel := context.WithCancel(c.Context)
+					defer cancel()
+
+					err = Exec(ctx, runtimeClient, optsCopy)
+					if err != nil {
+						return fmt.Errorf("execing command in container %s: %w", id, err)
+					}
+				}
+
+				return nil
+			})
+		}
+
+		errs := AggregateGoroutines(funcs...)
+
+		if ignoreErrors {
+			logrus.Debugf("Ignoring errors: %v", errs)
+
 			return nil
 		}
-		err = Exec(runtimeClient, opts)
-		if err != nil {
-			return errors.Wrap(err, "execing command in container")
-		}
-		return nil
+
+		return errs
 	},
+}
+
+const (
+	flagTLSSNI  = "tls-sni"
+	flagTLSCA   = "tls-ca"
+	flagTLSCert = "tls-cert"
+	flagTLSKey  = "tls-key"
+)
+
+func tlsConfigFromFlags(ctx *cli.Context) (*rest.TLSClientConfig, error) {
+	cfg := &rest.TLSClientConfig{
+		ServerName: ctx.String(flagTLSSNI),
+		CAFile:     ctx.String(flagTLSCA),
+		CertFile:   ctx.String(flagTLSCert),
+		KeyFile:    ctx.String(flagTLSKey),
+	}
+	if cfg.CAFile == "" && cfg.CertFile == "" && cfg.KeyFile == "" {
+		return &rest.TLSClientConfig{Insecure: true}, nil
+	}
+
+	if cfg.CertFile == "" || cfg.KeyFile == "" {
+		return nil, fmt.Errorf(
+			"both flags --%s and --%s are required for TLS streaming, only --%s is optional",
+			flagTLSCert, flagTLSKey, flagTLSCA,
+		)
+	}
+
+	return cfg, nil
 }
 
 // ExecSync sends an ExecSyncRequest to the server, and parses
 // the returned ExecSyncResponse. The function returns the corresponding exit
 // code beside an general error.
-func ExecSync(client pb.RuntimeServiceClient, opts execOptions) (int, error) {
+func ExecSync(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	opts *execOptions,
+) (int, error) {
 	request := &pb.ExecSyncRequest{
 		ContainerId: opts.id,
 		Cmd:         opts.cmd,
 		Timeout:     opts.timeout,
 	}
 	logrus.Debugf("ExecSyncRequest: %v", request)
-	r, err := client.ExecSync(context.Background(), request)
-	logrus.Debugf("ExecSyncResponse: %v", r)
+
+	timeoutDuration := time.Duration(opts.timeout) * time.Second
+
+	type stdio struct {
+		stdout, stderr []byte
+	}
+
+	io, err := InterruptableRPC(ctx, func(ctx context.Context) (*stdio, error) {
+		stdout, stderr, err := client.ExecSync(ctx, opts.id, opts.cmd, timeoutDuration)
+		if err != nil {
+			return nil, err
+		}
+
+		return &stdio{stdout, stderr}, nil
+	})
 	if err != nil {
 		return 1, err
 	}
-	fmt.Println(string(r.Stdout))
-	fmt.Println(string(r.Stderr))
-	return int(r.ExitCode), nil
+
+	fmt.Println(string(io.stdout))
+	fmt.Println(string(io.stderr))
+
+	return 0, nil
 }
 
-// Exec sends an ExecRequest to server, and parses the returned ExecResponse
-func Exec(client pb.RuntimeServiceClient, opts execOptions) error {
+// Exec sends an ExecRequest to server, and parses the returned ExecResponse.
+func Exec(ctx context.Context, client internalapi.RuntimeService, opts *execOptions) error {
 	request := &pb.ExecRequest{
 		ContainerId: opts.id,
 		Cmd:         opts.cmd,
@@ -132,12 +370,17 @@ func Exec(client pb.RuntimeServiceClient, opts execOptions) error {
 	}
 
 	logrus.Debugf("ExecRequest: %v", request)
-	r, err := client.Exec(context.Background(), request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) (*pb.ExecResponse, error) {
+		return client.Exec(ctx, request)
+	})
 	logrus.Debugf("ExecResponse: %v", r)
+
 	if err != nil {
 		return err
 	}
-	execURL := r.Url
+
+	execURL := r.GetUrl()
 
 	URL, err := url.Parse(execURL)
 	if err != nil {
@@ -153,39 +396,80 @@ func Exec(client pb.RuntimeServiceClient, opts execOptions) error {
 	}
 
 	logrus.Debugf("Exec URL: %v", URL)
-	return stream(opts.stdin, opts.tty, URL)
+
+	return stream(ctx, opts.stdin, opts.tty, opts.transport, URL, opts.tlsConfig)
 }
 
-func stream(in, tty bool, url *url.URL) error {
-	executor, err := remoteclient.NewSPDYExecutor(&restclient.Config{TLSClientConfig: restclient.TLSClientConfig{Insecure: true}}, "POST", url)
+func stream(
+	ctx context.Context,
+	in, tty bool,
+	transport string,
+	parsedURL *url.URL,
+	tlsConfig *rest.TLSClientConfig,
+) error {
+	executor, err := common.GetExecutor(transport, parsedURL, tlsConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("get executor: %w", err)
 	}
 
-	stdin, stdout, stderr := dockerterm.StdStreams()
+	stdin, stdout, stderr := mobyterm.StdStreams()
 	streamOptions := remoteclient.StreamOptions{
 		Stdout: stdout,
 		Stderr: stderr,
 		Tty:    tty,
 	}
+
 	if in {
 		streamOptions.Stdin = stdin
 	}
+
 	logrus.Debugf("StreamOptions: %v", streamOptions)
+
 	if !tty {
-		return executor.Stream(streamOptions)
+		return executor.StreamWithContext(ctx, streamOptions)
 	}
+
+	detachKeys, err := mobyterm.ToBytes(detachSequence)
+	if err != nil {
+		return errors.New("could not bind detach keys")
+	}
+
+	pr := mobyterm.NewEscapeProxy(streamOptions.Stdin, detachKeys)
+	streamOptions.Stdin = pr
+
 	if !in {
-		return fmt.Errorf("tty=true must be specified with interactive=true")
+		return errors.New("tty=true must be specified with interactive=true")
 	}
+
 	t := term.TTY{
 		In:  stdin,
 		Out: stdout,
 		Raw: true,
 	}
 	if !t.IsTerminalIn() {
-		return fmt.Errorf("input is not a terminal")
+		return errors.New("input is not a terminal")
 	}
-	streamOptions.TerminalSizeQueue = t.MonitorSize(t.GetSize())
-	return t.Safe(func() error { return executor.Stream(streamOptions) })
+
+	streamOptions.TerminalSizeQueue = &terminalSizeQueueAdapter{queue: t.MonitorSize(t.GetSize())}
+
+	return t.Safe(func() error { return executor.StreamWithContext(ctx, streamOptions) })
+}
+
+// terminalSizeQueueAdapter adapts k8s.io/kubectl/pkg/util/term.TerminalSizeQueue
+// to k8s.io/client-go/tools/remotecommand.TerminalSizeQueue.
+type terminalSizeQueueAdapter struct {
+	queue term.TerminalSizeQueue
+}
+
+// Next returns the next terminal size in the queue.
+func (t *terminalSizeQueueAdapter) Next() *remoteclient.TerminalSize {
+	size := t.queue.Next()
+	if size == nil {
+		return nil
+	}
+
+	return &remoteclient.TerminalSize{
+		Width:  size.Width,
+		Height: size.Height,
+	}
 }

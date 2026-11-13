@@ -1,138 +1,219 @@
----
+version: "2"
 run:
   concurrency: 6
-  deadline: 5m
 linters:
-  disable-all: true
+  default: none
   enable:
-    - deadcode
-    - depguard
-    - gofmt
-    - goimports
+    - arangolint
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - clickhouselint
+    - containedctx
+    - contextcheck
+    - copyloopvar
+    - cyclop
+    - decorder
+    - dogsled
+    - dupl
+    - dupword
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - exptostd
+    - fatcontext
+    - forbidigo
+    - forcetypeassert
+    - funcorder
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - godoclint
+    - godot
+    - godox
+    - goheader
+    - gomoddirectives
+    - gomodguard_v2
+    - gosec
+    - goprintffuncname
+    - gosmopolitan
     - govet
+    - grouper
+    - iface
+    - importas
+    - inamedparam
     - ineffassign
+    - interfacebloat
+    - intrange
+    - iotamixing
+    - loggercheck
+    - maintidx
+    - makezero
+    - mirror
     - misspell
+    - modernize
+    - musttag
     - nakedret
+    - nestif
+    - nilerr
+    - nilnesserr
+    - nlreturn
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - paralleltest
+    - perfsprint
     - prealloc
-    - structcheck
-    - typecheck
-    - varcheck
-    # - asciicheck
-    # - bodyclose
-    # - dogsled
-    # - dupl
-    # - errcheck
-    # - errorlint
-    # - exhaustive
-    # - exhaustivestruct
-    # - exportloopref
+    - predeclared
+    - promlinter
+    - protogetter
+    - reassign
+    - recvcheck
+    - revive
+    - rowserrcheck
+    - sloglint
+    - spancheck
+    - sqlclosecheck
+    - staticcheck
+    - tagalign
+    - tagliatelle
+    - testableexamples
+    - testifylint
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - unqueryvet
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+    - wsl_v5
+    - zerologlint
+    # - depguard
+    # - err113
+    # - exhaustruct_v5
     # - funlen
-    # - gci
     # - gochecknoglobals
     # - gochecknoinits
-    # - gocognit
-    # - goconst
-    # - gocritic
-    # - gocyclo
-    # - godot
-    # - godox
-    # - goerr113
-    # - gofumpt
-    # - goheader
-    # - golint
-    # - gomnd
-    # - gomodguard
-    # - goprintffuncname
-    # - gosec (gas)
-    # - gosimple (megacheck)
-    # - interfacer
+    # - ireturn
     # - lll
-    # - maligned
-    # - nestif
-    # - nlreturn
-    # - noctx
-    # - nolintlint
-    # - rowserrcheck
-    # - scopelint
-    # - sqlclosecheck
-    # - staticcheck
-    # - stylecheck
+    # - mnd
+    # - nilnil
+    # - noinlineerr
+    # - nonamedreturns
     # - testpackage
-    # - tparallel
-    # - unconvert
-    # - unparam
-    # - unused
-    # - whitespace
+    # - varnamelen
     # - wrapcheck
-    # - wsl
-linters-settings:
-  gocritic:
-    enabled-checks:
-      # Diagnostic
-      - appendAssign
-      - argOrder
-      - badCond
-      - caseOrder
-      - codegenComment
-      - commentedOutCode
-      - deprecatedComment
-      - dupArg
-      - dupBranchBody
-      - dupCase
-      - dupSubExpr
-      - exitAfterDefer
-      - flagDeref
-      - flagName
-      - nilValReturn
-      - offBy1
-      - sloppyReassign
-      - weakCond
-      - octalLiteral
-
-      # Performance
-      - appendCombine
-      - equalFold
-      - hugeParam
-      - indexAlloc
-      - rangeExprCopy
-      - rangeValCopy
-
-      # Style
-      - assignOp
-      - boolExprSimplify
-      - captLocal
-      - commentFormatting
-      - commentedOutImport
-      - defaultCaseOrder
-      - docStub
-      - elseif
-      - emptyFallthrough
-      - emptyStringTest
-      - hexLiteral
-      - ifElseChain
-      - methodExprCall
-      - regexpMust
-      - singleCaseSwitch
-      - sloppyLen
-      - stringXbytes
-      - switchTrue
-      - typeAssertChain
-      - typeSwitchVar
-      - underef
-      - unlabelStmt
-      - unlambda
-      - unslice
-      - valSwap
-      - wrapperFunc
-      - yodaStyleExpr
-
-      # Opinionated
-      - builtinShadow
-      - importShadow
-      - initClause
-      - nestingReduce
-      - paramTypeCombine
-      - ptrToRefParam
-      - typeUnparen
-      - unnamedResult
-      - unnecessaryBlock
+  settings:
+    goconst:
+      min-occurrences: 5
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+    cyclop:
+      max-complexity: 37
+    forbidigo:
+      analyze-types: false
+      forbid:
+        - pattern: ^logrus\.Fatal.*$
+          msg: "use error returns instead of logrus.Fatal*; let main() print and exit with non-zero"
+        - pattern: ^log\.Fatal.*$
+          msg: "use error returns instead of log.Fatal*; let main() print and exit with non-zero"
+        - pattern: ^klog\.Fatal.*$
+          msg: "use error returns instead of klog.Fatal*; let main() print and exit with non-zero"
+        - pattern: ^os\.Exit.*$
+          msg: "use error returns instead of os.Exit; let main() handle the exit"
+    gocognit:
+      min-complexity: 71
+    gocritic:
+      enable-all: true
+    gocyclo:
+      min-complexity: 35
+    godox:
+      keywords:
+        - BUG
+        - FIXME
+        - HACK
+    maintidx:
+      under: 10
+    nestif:
+      min-complexity: 17
+    revive:
+      rules:
+        - name: dot-imports
+          disabled: true
+    staticcheck:
+      dot-import-whitelist:
+        - github.com/onsi/ginkgo/v2
+        - github.com/onsi/gomega
+        - github.com/onsi/gomega/gbytes
+        - github.com/onsi/gomega/gexec
+      checks:
+        - -ST1001
+        - SA1019
+        - all
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # TODO: clean up these exceptions and remove them from the config
+      - linters:
+          - goconst
+        path: cmd/crictl/
+      - linters:
+          - goconst
+        path: _test\.go$
+      - linters:
+          - goconst
+        path: pkg/validate/
+      - linters:
+          - forbidigo
+        path: _test\.go$
+      - linters:
+          - staticcheck
+        text: "SA1019:.*ApparmorProfile"
+        path: pkg/validate/
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+    - golines
+    - swaggo
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+    goimports:
+      local-prefixes:
+        - sigs.k8s.io/cri-tools
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

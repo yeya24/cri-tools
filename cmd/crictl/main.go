@@ -17,135 +17,59 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 
-	"google.golang.org/grpc"
-
-	internalapi "k8s.io/cri-api/pkg/apis"
-	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
-	"k8s.io/kubernetes/pkg/kubelet/util"
-
-	"github.com/kubernetes-sigs/cri-tools/pkg/common"
-	"github.com/kubernetes-sigs/cri-tools/pkg/version"
+	"sigs.k8s.io/cri-tools/pkg/common"
+	"sigs.k8s.io/cri-tools/pkg/framework"
+	"sigs.k8s.io/cri-tools/pkg/tracing"
+	"sigs.k8s.io/cri-tools/pkg/version"
 )
 
 const (
-	defaultTimeout = 2 * time.Second
+	defaultTimeout        = 2 * time.Second
+	defaultTimeoutWindows = 200 * time.Second
 )
-
-var (
-	// RuntimeEndpoint is CRI server runtime endpoint
-	RuntimeEndpoint string
-	// RuntimeEndpointIsSet is true when RuntimeEndpoint is configured
-	RuntimeEndpointIsSet bool
-	// ImageEndpoint is CRI server image endpoint, default same as runtime endpoint
-	ImageEndpoint string
-	// ImageEndpointIsSet is true when ImageEndpoint is configured
-	ImageEndpointIsSet bool
-	// Timeout  of connecting to server (default: 10s)
-	Timeout time.Duration
-	// Debug enable debug output
-	Debug bool
-	// PullImageOnCreate enables pulling image on create requests
-	PullImageOnCreate bool
-	// DisablePullOnRun disable pulling image on run requests
-	DisablePullOnRun bool
-)
-
-func getRuntimeClientConnection(context *cli.Context) (*grpc.ClientConn, error) {
-	if RuntimeEndpointIsSet && RuntimeEndpoint == "" {
-		return nil, fmt.Errorf("--runtime-endpoint is not set")
-	}
-	logrus.Debug("get runtime connection")
-	// If no EP set then use the default endpoint types
-	if !RuntimeEndpointIsSet {
-		logrus.Warningf("runtime connect using default endpoints: %v. "+
-			"As the default settings are now deprecated, you should set the "+
-			"endpoint instead.", defaultRuntimeEndpoints)
-		logrus.Debug("Note that performance maybe affected as each default " +
-			"connection attempt takes n-seconds to complete before timing out " +
-			"and going to the next in sequence.")
-		return getConnection(defaultRuntimeEndpoints)
-	}
-	return getConnection([]string{RuntimeEndpoint})
-}
-
-func getImageClientConnection(context *cli.Context) (*grpc.ClientConn, error) {
-	if ImageEndpoint == "" {
-		if RuntimeEndpointIsSet && RuntimeEndpoint == "" {
-			return nil, fmt.Errorf("--image-endpoint is not set")
-		}
-		ImageEndpoint = RuntimeEndpoint
-		ImageEndpointIsSet = RuntimeEndpointIsSet
-	}
-	logrus.Debugf("get image connection")
-	// If no EP set then use the default endpoint types
-	if !ImageEndpointIsSet {
-		logrus.Warningf("image connect using default endpoints: %v. "+
-			"As the default settings are now deprecated, you should set the "+
-			"endpoint instead.", defaultRuntimeEndpoints)
-		logrus.Debug("Note that performance maybe affected as each default " +
-			"connection attempt takes n-seconds to complete before timing out " +
-			"and going to the next in sequence.")
-		return getConnection(defaultRuntimeEndpoints)
-	}
-	return getConnection([]string{ImageEndpoint})
-}
-
-func getConnection(endPoints []string) (*grpc.ClientConn, error) {
-	if endPoints == nil || len(endPoints) == 0 {
-		return nil, fmt.Errorf("endpoint is not set")
-	}
-	endPointsLen := len(endPoints)
-	var conn *grpc.ClientConn
-	for indx, endPoint := range endPoints {
-		logrus.Debugf("connect using endpoint '%s' with '%s' timeout", endPoint, Timeout)
-		addr, dialer, err := util.GetAddressAndDialer(endPoint)
-		if err != nil {
-			if indx == endPointsLen-1 {
-				return nil, err
-			}
-			logrus.Error(err)
-			continue
-		}
-		conn, err = grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(Timeout), grpc.WithContextDialer(dialer))
-		if err != nil {
-			errMsg := errors.Wrapf(err, "connect endpoint '%s', make sure you are running as root and the endpoint has been started", endPoint)
-			if indx == endPointsLen-1 {
-				return nil, errMsg
-			}
-			logrus.Error(errMsg)
-		} else {
-			logrus.Debugf("connected successfully using endpoint: %s", endPoint)
-			break
-		}
-	}
-	return conn, nil
-}
-
-func getRuntimeService(context *cli.Context) (internalapi.RuntimeService, error) {
-	return remote.NewRemoteRuntimeService(RuntimeEndpoint, Timeout)
-}
 
 func getTimeout(timeDuration time.Duration) time.Duration {
 	if timeDuration.Seconds() > 0 {
 		return timeDuration
 	}
+
+	if runtime.GOOS == framework.OSWindows {
+		return defaultTimeoutWindows
+	}
+
 	return defaultTimeout // use default
 }
 
 func main() {
+	if err := run(); err != nil {
+		logrus.Error(err)
+		os.Exit(1) //nolint:forbidigo // intentional exit in main() after error handling
+	}
+}
+
+func run() error {
 	app := cli.NewApp()
 	app.Name = "crictl"
 	app.Usage = "client for CRI"
 	app.Version = version.Version
+	app.Metadata = map[string]any{}
 
 	app.Commands = []*cli.Command{
 		runtimeAttachCommand,
@@ -174,8 +98,20 @@ func main() {
 		updateContainerCommand,
 		configCommand,
 		statsCommand,
+		podStatsCommand,
+		podMetricsCommand,
+		metricDescriptorsCommand,
 		completionCommand,
+		checkpointContainerCommand,
+		runtimeConfigCommand,
+		eventsCommand,
+		updateRuntimeConfigCommand,
 	}
+
+	slices.SortFunc(
+		app.Commands,
+		func(a, b *cli.Command) int { return strings.Compare(a.Name, b.Name) },
+	)
 
 	runtimeEndpointUsage := fmt.Sprintf("Endpoint of CRI container runtime "+
 		"service (default: uses in order the first successful one of %v). "+
@@ -215,85 +151,180 @@ func main() {
 			Aliases: []string{"D"},
 			Usage:   "Enable debug mode",
 		},
+		&cli.IntFlag{
+			Name:  "max-retries",
+			Value: 3,
+			Usage: "Max retries for connecting to an explicitly set endpoint with exponential backoff (0 to disable, negative for infinite)",
+		},
+		&cli.BoolFlag{
+			Name:  "enable-tracing",
+			Usage: "Enable OpenTelemetry tracing.",
+		},
+		&cli.IntFlag{
+			Name:  "tracing-sampling-rate-per-million",
+			Usage: "Number of samples to collect per million OpenTelemetry spans. Set to 1000000 or -1 to always sample.",
+			Value: -1,
+		},
+		&cli.StringFlag{
+			Name:  "tracing-endpoint",
+			Usage: "Address to which the gRPC tracing collector will send spans to.",
+			Value: "127.0.0.1:4317",
+		},
+		&cli.StringFlag{
+			Name:  "profile-cpu",
+			Usage: "Write a pprof CPU profile to the provided path.",
+		},
+		&cli.StringFlag{
+			Name:  "profile-mem",
+			Usage: "Write a pprof memory profile to the provided path.",
+		},
 	}
+
+	var cpuProfile *os.File
+
+	defer func() {
+		if cpuProfile != nil {
+			pprof.StopCPUProfile()
+			cpuProfile.Close()
+		}
+	}()
 
 	app.Before = func(context *cli.Context) (err error) {
 		var config *common.ServerConfiguration
+
 		var exePath string
 
+		cpuProfilePath := context.String("profile-cpu")
+		if cpuProfilePath != "" {
+			cpuProfilePath, err = filepath.Abs(cpuProfilePath)
+			if err != nil {
+				return fmt.Errorf("unable to get absolute memory profile path: %w", err)
+			}
+
+			logrus.Infof("Creating CPU profile in: %s", cpuProfilePath)
+
+			cpuProfile, err = os.Create(cpuProfilePath)
+			if err != nil {
+				return fmt.Errorf("could not create CPU profile %q: %w", cpuProfilePath, err)
+			}
+
+			if err := pprof.StartCPUProfile(cpuProfile); err != nil {
+				return fmt.Errorf("could not start CPU profiling in %q: %w", cpuProfilePath, err)
+			}
+		}
+
 		if exePath, err = os.Executable(); err != nil {
-			logrus.Fatal(err)
+			return fmt.Errorf("get executable path: %w", err)
 		}
-		if config, err = common.GetServerConfigFromFile(context.String("config"), exePath); err != nil {
+
+		if config, err = common.GetServerConfigFromFile(
+			context.String("config"),
+			exePath,
+		); err != nil {
 			if context.IsSet("config") {
-				logrus.Fatal(err)
+				// crictl config can create a missing file; let it through.
+				isConfigCmd := context.Args().First() == "config"
+				if !isConfigCmd || !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("get server config: %w", err)
+				}
 			}
 		}
 
-		if config == nil {
-			RuntimeEndpoint = context.String("runtime-endpoint")
-			if context.IsSet("runtime-endpoint") {
-				RuntimeEndpointIsSet = true
+		cfg := newCrictlConfig(context, config)
+
+		// Configure tracing if enabled
+		if context.IsSet("enable-tracing") {
+			cfg.TracerProvider, err = tracing.Init(
+				context.Context,
+				context.String("tracing-endpoint"),
+				context.Int("tracing-sampling-rate-per-million"),
+			)
+			if err != nil {
+				return fmt.Errorf("init tracing: %w", err)
 			}
-			ImageEndpoint = context.String("image-endpoint")
-			if context.IsSet("image-endpoint") {
-				ImageEndpointIsSet = true
+
+			// Start a root span named after the invoked command so that all
+			// command operations are recorded as children of it. The span is
+			// ended in run() once app.Run returns.
+			spanName := "crictl"
+			if context.Args().Present() {
+				spanName = context.Args().First()
 			}
-			if context.IsSet("timeout") {
-				Timeout = getTimeout(context.Duration("timeout"))
-			} else {
-				Timeout = context.Duration("timeout")
-			}
-			Debug = context.Bool("debug")
-			DisablePullOnRun = false
-		} else {
-			// Command line flags overrides config file.
-			if context.IsSet("runtime-endpoint") {
-				RuntimeEndpoint = context.String("runtime-endpoint")
-				RuntimeEndpointIsSet = true
-			} else if config.RuntimeEndpoint != "" {
-				RuntimeEndpoint = config.RuntimeEndpoint
-				RuntimeEndpointIsSet = true
-			} else {
-				RuntimeEndpoint = context.String("runtime-endpoint")
-			}
-			if context.IsSet("image-endpoint") {
-				ImageEndpoint = context.String("image-endpoint")
-				ImageEndpointIsSet = true
-			} else if config.ImageEndpoint != "" {
-				ImageEndpoint = config.ImageEndpoint
-				ImageEndpointIsSet = true
-			} else {
-				ImageEndpoint = context.String("image-endpoint")
-			}
-			if context.IsSet("timeout") {
-				Timeout = getTimeout(context.Duration("timeout"))
-			} else if config.Timeout > 0 { // 0/neg value set to default timeout
-				Timeout = config.Timeout
-			} else {
-				Timeout = context.Duration("timeout")
-			}
-			if context.IsSet("debug") {
-				Debug = context.Bool("debug")
-			} else {
-				Debug = config.Debug
-			}
-			PullImageOnCreate = config.PullImageOnCreate
-			DisablePullOnRun = config.DisablePullOnRun
+
+			ctx, span := cfg.TracerProvider.Tracer("sigs.k8s.io/cri-tools/cmd/crictl").
+				Start(context.Context, spanName)
+			cfg.RootSpan = span
+			cfg.RootSpan.SetAttributes(attribute.String("command", spanName))
+
+			context.Context = ctx
 		}
 
-		if Debug {
-			logrus.SetLevel(logrus.DebugLevel)
-		}
+		context.App.Metadata[configKey] = cfg
+
 		return nil
 	}
+
+	app.After = func(ctx *cli.Context) (err error) {
+		memProfilePath := ctx.String("profile-mem")
+		if memProfilePath != "" {
+			memProfilePath, err = filepath.Abs(memProfilePath)
+			if err != nil {
+				return fmt.Errorf("unable to get absolute memory profile path: %w", err)
+			}
+
+			logrus.Infof("Creating memory profile in: %s", memProfilePath)
+
+			file, err := os.Create(memProfilePath)
+			if err != nil {
+				return fmt.Errorf("could not create memory profile %q: %w", memProfilePath, err)
+			}
+			defer file.Close()
+
+			// Ensure up to date data
+			runtime.GC()
+
+			if err := pprof.WriteHeapProfile(file); err != nil {
+				return fmt.Errorf("could not write memory profile in %q: %w", memProfilePath, err)
+			}
+		}
+
+		return nil
+	}
+
 	// sort all flags
 	for _, cmd := range app.Commands {
 		sort.Sort(cli.FlagsByName(cmd.Flags))
 	}
+
 	sort.Sort(cli.FlagsByName(app.Flags))
 
-	if err := app.Run(os.Args); err != nil {
-		logrus.Fatal(err)
+	err := app.Run(os.Args)
+
+	// Record the command result on the root span and ensure that all spans are
+	// processed before exiting.
+	if v, ok := app.Metadata[configKey]; ok {
+		cfg, _ := v.(*CrictlConfig)
+		if cfg != nil {
+			if err != nil && cfg.RootSpan != nil {
+				cfg.RootSpan.SetStatus(codes.Error, err.Error())
+				cfg.RootSpan.RecordError(err)
+			}
+
+			if cfg.RootSpan != nil {
+				cfg.RootSpan.End()
+			}
+
+			if cfg.TracerProvider != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+
+				if shutdownErr := cfg.TracerProvider.Shutdown(shutdownCtx); shutdownErr != nil {
+					logrus.Errorf("Unable to shutdown tracer provider: %v", shutdownErr)
+				}
+
+				cancel()
+			}
+		}
 	}
+
+	return err
 }

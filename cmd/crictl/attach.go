@@ -17,14 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/common"
 )
 
 var runtimeAttachCommand = &cli.Command{
@@ -43,39 +45,79 @@ var runtimeAttachCommand = &cli.Command{
 			Aliases: []string{"i"},
 			Usage:   "Keep STDIN open",
 		},
+		&cli.StringFlag{
+			Name:    transportFlag,
+			Aliases: []string{"r"},
+			Value:   common.TransportSpdy,
+			Usage: fmt.Sprintf(
+				"Transport protocol to use, one of: %s|%s",
+				common.TransportSpdy,
+				common.TransportWebsocket,
+			),
+		},
+		&cli.StringFlag{
+			Name:    flagTLSSNI,
+			Usage:   "Server name used in the TLS client to check server certificates against",
+			Aliases: []string{"tls-server-name"},
+			Value:   "localhost",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSCA,
+			Usage: "Path to the streaming TLS CA certificate",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSCert,
+			Usage: "Path to the streaming TLS certificate",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSKey,
+			Usage: "Path to the streaming TLS key",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		id := context.Args().First()
+	Action: func(c *cli.Context) error {
+		id := c.Args().First()
 		if id == "" {
-			return cli.ShowSubcommandHelp(context)
+			return errIDEmpty
 		}
 
-		runtimeClient, conn, err := getRuntimeClient(context)
+		if c.NArg() != 1 {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, conn)
 
-		var opts = attachOptions{
-			id:    id,
-			tty:   context.Bool("tty"),
-			stdin: context.Bool("stdin"),
+		ctx, cancel := context.WithCancel(c.Context)
+		defer cancel()
+
+		opts := attachOptions{
+			id:        id,
+			tty:       c.Bool("tty"),
+			stdin:     c.Bool("stdin"),
+			transport: c.String("transport"),
 		}
-		err = Attach(runtimeClient, opts)
+
+		opts.tlsConfig, err = tlsConfigFromFlags(c)
 		if err != nil {
-			return errors.Wrap(err, "attaching running container failed")
-
+			return fmt.Errorf("get TLS config from flags: %w", err)
 		}
+
+		if err = Attach(ctx, runtimeClient, opts); err != nil {
+			return fmt.Errorf("attaching running container failed: %w", err)
+		}
+
 		return nil
 	},
 }
 
-// Attach sends an AttachRequest to server, and parses the returned AttachResponse
-func Attach(client pb.RuntimeServiceClient, opts attachOptions) error {
+// Attach sends an AttachRequest to server, and parses the returned AttachResponse.
+func Attach(ctx context.Context, client internalapi.RuntimeService, opts attachOptions) error {
 	if opts.id == "" {
-		return fmt.Errorf("ID cannot be empty")
-
+		return errIDEmpty
 	}
+
 	request := &pb.AttachRequest{
 		ContainerId: opts.id,
 		Tty:         opts.tty,
@@ -84,12 +126,17 @@ func Attach(client pb.RuntimeServiceClient, opts attachOptions) error {
 		Stderr:      !opts.tty,
 	}
 	logrus.Debugf("AttachRequest: %v", request)
-	r, err := client.Attach(context.Background(), request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) (*pb.AttachResponse, error) {
+		return client.Attach(ctx, request)
+	})
 	logrus.Debugf("AttachResponse: %v", r)
+
 	if err != nil {
 		return err
 	}
-	attachURL := r.Url
+
+	attachURL := r.GetUrl()
 
 	URL, err := url.Parse(attachURL)
 	if err != nil {
@@ -99,10 +146,12 @@ func Attach(client pb.RuntimeServiceClient, opts attachOptions) error {
 	if URL.Host == "" {
 		URL.Host = kubeletURLHost
 	}
+
 	if URL.Scheme == "" {
 		URL.Scheme = kubeletURLSchema
 	}
 
 	logrus.Debugf("Attach URL: %v", URL)
-	return stream(opts.stdin, opts.tty, URL)
+
+	return stream(ctx, opts.stdin, opts.tty, opts.transport, URL, opts.tlsConfig)
 }

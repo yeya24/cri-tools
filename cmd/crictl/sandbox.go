@@ -17,35 +17,40 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docker/go-units"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-
-	errorUtils "k8s.io/apimachinery/pkg/util/errors"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
-
-type sandboxByCreated []*pb.PodSandbox
-
-func (a sandboxByCreated) Len() int      { return len(a) }
-func (a sandboxByCreated) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-func (a sandboxByCreated) Less(i, j int) bool {
-	return a[i].CreatedAt > a[j].CreatedAt
-}
 
 var runPodCommand = &cli.Command{
 	Name:      "runp",
 	Usage:     "Run a new pod",
 	ArgsUsage: "pod-config.[json|yaml]",
+	Subcommands: []*cli.Command{
+		{
+			Name:      "jsonschema",
+			Aliases:   []string{"js"},
+			Usage:     "Display the JSON schema for the pod-config.json",
+			UsageText: "The schema will be generated from the PodSandboxConfig of the CRI API compiled with this version of crictl",
+			Action: func(*cli.Context) error {
+				return printJSONSchema(&pb.PodSandboxConfig{})
+			},
+		},
+	},
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:    "runtime",
@@ -55,34 +60,36 @@ var runPodCommand = &cli.Command{
 		&cli.DurationFlag{
 			Name:    "cancel-timeout",
 			Aliases: []string{"T"},
-			Value:   0,
 			Usage:   "Seconds to wait for a run pod sandbox request to complete before cancelling the request",
 		},
 	},
 
-	Action: func(context *cli.Context) error {
-		sandboxSpec := context.Args().First()
-		if sandboxSpec == "" {
-			return cli.ShowSubcommandHelp(context)
+	Action: func(c *cli.Context) error {
+		sandboxSpec := c.Args().First()
+		if c.NArg() != 1 || sandboxSpec == "" {
+			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+		runtimeClient, err := configFromContext(
+			c,
+		).GetRuntimeService(c.Context, c.Duration("cancel-timeout"))
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
 		podSandboxConfig, err := loadPodSandboxConfig(sandboxSpec)
 		if err != nil {
-			return errors.Wrap(err, "load podSandboxConfig")
+			return fmt.Errorf("load podSandboxConfig: %w", err)
 		}
 
 		// Test RuntimeServiceClient.RunPodSandbox
-		podID, err := RunPodSandbox(runtimeClient, podSandboxConfig, context.String("runtime"), context.Duration("cancel-timeout"))
+		podID, err := RunPodSandbox(c.Context, runtimeClient, podSandboxConfig, c.String("runtime"))
 		if err != nil {
-			return errors.Wrap(err, "run pod sandbox")
+			return fmt.Errorf("run pod sandbox: %w", err)
 		}
+
 		fmt.Println(podID)
+
 		return nil
 	},
 }
@@ -91,22 +98,25 @@ var stopPodCommand = &cli.Command{
 	Name:      "stopp",
 	Usage:     "Stop one or more running pods",
 	ArgsUsage: "POD-ID [POD-ID...]",
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
+	Action: func(c *cli.Context) error {
+		if c.NArg() == 0 {
+			return cli.ShowSubcommandHelp(c)
 		}
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
-		for i := 0; i < context.NArg(); i++ {
-			id := context.Args().Get(i)
-			err := StopPodSandbox(runtimeClient, id)
+
+		for i := range c.NArg() {
+			id := c.Args().Get(i)
+
+			err := StopPodSandbox(c.Context, runtimeClient, id)
 			if err != nil {
-				return errors.Wrapf(err, "stopping the pod sandbox %q", id)
+				return fmt.Errorf("stopping the pod sandbox %q: %w", id, err)
 			}
 		}
+
 		return nil
 	},
 }
@@ -129,59 +139,56 @@ var removePodCommand = &cli.Command{
 		},
 	},
 	Action: func(ctx *cli.Context) error {
-		runtimeClient, runtimeConn, err := getRuntimeClient(ctx)
+		runtimeClient, err := configFromContext(ctx).GetRuntimeService(ctx.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(ctx, runtimeConn)
 
-		ids := ctx.Args().Slice()
-		if ctx.Bool("all") {
-			r, err := runtimeClient.ListPodSandbox(context.Background(),
-				&pb.ListPodSandboxRequest{})
-			if err != nil {
-				return err
-			}
-			ids = nil
-			for _, sb := range r.GetItems() {
-				ids = append(ids, sb.GetId())
-			}
-		}
-
-		lenIDs := len(ids)
-		if lenIDs == 0 {
-			return cli.ShowSubcommandHelp(ctx)
+		ids, err := collectIDs(
+			ctx.Context,
+			ctx,
+			func(ctx context.Context) ([]*pb.PodSandbox, error) {
+				return runtimeClient.ListPodSandbox(ctx, nil)
+			},
+			"pod",
+		)
+		if err != nil || len(ids) == 0 {
+			return err
 		}
 
 		funcs := []func() error{}
 		for _, id := range ids {
-			podId := id
 			funcs = append(funcs, func() error {
-				resp, err := runtimeClient.PodSandboxStatus(context.Background(),
-					&pb.PodSandboxStatusRequest{PodSandboxId: podId})
+				resp, err := InterruptableRPC(
+					ctx.Context,
+					func(ctx context.Context) (*pb.PodSandboxStatusResponse, error) {
+						return runtimeClient.PodSandboxStatus(ctx, id, false)
+					},
+				)
 				if err != nil {
-					return errors.Wrapf(err, "getting sandbox status of pod %q", podId)
+					return fmt.Errorf("getting sandbox status of pod %q: %w", id, err)
 				}
-				if resp.Status.State == pb.PodSandboxState_SANDBOX_READY {
+
+				if resp.GetStatus().GetState() == pb.PodSandboxState_SANDBOX_READY {
 					if ctx.Bool("force") {
-						if err := StopPodSandbox(runtimeClient, podId); err != nil {
-							return errors.Wrapf(err, "stopping the pod sandbox %q failed", podId)
+						if err := StopPodSandbox(ctx.Context, runtimeClient, id); err != nil {
+							return fmt.Errorf("stopping the pod sandbox %q failed: %w", id, err)
 						}
 					} else {
-						return errors.Errorf("pod sandbox %q is running, please stop it first", podId)
+						return fmt.Errorf("pod sandbox %q is running, please stop it first", id)
 					}
 				}
 
-				err = RemovePodSandbox(runtimeClient, podId)
+				err = RemovePodSandbox(ctx.Context, runtimeClient, id)
 				if err != nil {
-					return errors.Wrapf(err, "removing the pod sandbox %q", podId)
+					return fmt.Errorf("removing the pod sandbox %q: %w", id, err)
 				}
 
 				return nil
 			})
 		}
 
-		return errorUtils.AggregateGoroutines(funcs...)
+		return AggregateGoroutines(funcs...)
 	},
 }
 
@@ -205,24 +212,83 @@ var podStatusCommand = &cli.Command{
 			Name:  "template",
 			Usage: "The template string is only used when output is go-template; The Template format is golang template",
 		},
+		&cli.StringFlag{
+			Name:  "name",
+			Usage: "Filter by pod name regular expression pattern",
+		},
+		&cli.StringFlag{
+			Name:  "namespace",
+			Usage: "Filter by pod namespace regular expression pattern",
+		},
+		&cli.StringFlag{
+			Name:    "state",
+			Aliases: []string{"s"},
+			Usage:   "Filter by pod state",
+		},
+		&cli.StringSliceFlag{
+			Name:  "label",
+			Usage: "Filter by key=value label",
+		},
+		&cli.BoolFlag{
+			Name:    "latest",
+			Aliases: []string{"l"},
+			Usage:   "Show the most recently created pod",
+		},
+		&cli.IntFlag{
+			Name:    "last",
+			Aliases: []string{"n"},
+			Usage:   "Show last n recently created pods. Set 0 for unlimited",
+		},
 	},
-	Action: func(context *cli.Context) error {
-		if context.NArg() == 0 {
-			return cli.ShowSubcommandHelp(context)
-		}
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+	Action: func(c *cli.Context) error {
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
-		for i := 0; i < context.NArg(); i++ {
-			id := context.Args().Get(i)
 
-			err := PodSandboxStatus(runtimeClient, id, context.String("output"), context.Bool("quiet"), context.String("template"))
+		ids := c.Args().Slice()
+
+		if len(ids) == 0 {
+			opts := &listOptions{
+				nameRegexp:         c.String("name"),
+				podNamespaceRegexp: c.String("namespace"),
+				state:              c.String("state"),
+				latest:             c.Bool("latest"),
+				last:               c.Int("last"),
+			}
+
+			opts.labels, err = parseLabelStringSlice(c.StringSlice("label"))
 			if err != nil {
-				return errors.Wrapf(err, "getting the pod sandbox status for %q", id)
+				return fmt.Errorf("parse label string slice: %w", err)
+			}
+
+			sbs, err := ListPodSandboxes(c.Context, runtimeClient, opts)
+			if err != nil {
+				return fmt.Errorf("listing pod sandboxes: %w", err)
+			}
+
+			for _, sb := range sbs {
+				ids = append(ids, sb.GetId())
 			}
 		}
+
+		if len(ids) == 0 {
+			logrus.Error("No IDs provided or nothing found per filter")
+
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		if err := podSandboxStatus(
+			c.Context,
+			runtimeClient,
+			ids,
+			c.String("output"),
+			c.Bool("quiet"),
+			c.String("template"),
+		); err != nil {
+			return fmt.Errorf("get the status of pod sandboxes: %w", err)
+		}
+
 		return nil
 	},
 }
@@ -234,44 +300,40 @@ var listPodCommand = &cli.Command{
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:  "id",
-			Value: "",
 			Usage: "filter by pod id",
 		},
 		&cli.StringFlag{
 			Name:  "name",
-			Value: "",
-			Usage: "filter by pod name regular expression pattern",
+			Usage: "Filter by pod name regular expression pattern",
 		},
 		&cli.StringFlag{
 			Name:  "namespace",
-			Value: "",
-			Usage: "filter by pod namespace regular expression pattern",
+			Usage: "Filter by pod namespace regular expression pattern",
 		},
 		&cli.StringFlag{
 			Name:    "state",
 			Aliases: []string{"s"},
-			Value:   "",
-			Usage:   "filter by pod state",
+			Usage:   "Filter by pod state",
 		},
 		&cli.StringSliceFlag{
 			Name:  "label",
-			Usage: "filter by key=value label",
+			Usage: "Filter by key=value label",
 		},
 		&cli.BoolFlag{
 			Name:    "verbose",
 			Aliases: []string{"v"},
-			Usage:   "show verbose info for pods",
+			Usage:   "Show verbose info for pods",
 		},
 		&cli.BoolFlag{
 			Name:    "quiet",
 			Aliases: []string{"q"},
-			Usage:   "list only pod IDs",
+			Usage:   "List only pod IDs",
 		},
 		&cli.StringFlag{
 			Name:    "output",
 			Aliases: []string{"o"},
 			Usage:   "Output format, One of: json|yaml|table",
-			Value:   "table",
+			Value:   outputTypeTable,
 		},
 		&cli.BoolFlag{
 			Name:    "latest",
@@ -288,87 +350,103 @@ var listPodCommand = &cli.Command{
 			Usage: "Show output without truncating the ID",
 		},
 	},
-	Action: func(context *cli.Context) error {
+	Action: func(c *cli.Context) error {
 		var err error
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
-		if err != nil {
-			return err
-		}
-		defer closeConnection(context, runtimeConn)
 
-		opts := listOptions{
-			id:                 context.String("id"),
-			state:              context.String("state"),
-			verbose:            context.Bool("verbose"),
-			quiet:              context.Bool("quiet"),
-			output:             context.String("output"),
-			latest:             context.Bool("latest"),
-			last:               context.Int("last"),
-			noTrunc:            context.Bool("no-trunc"),
-			nameRegexp:         context.String("name"),
-			podNamespaceRegexp: context.String("namespace"),
-		}
-		opts.labels, err = parseLabelStringSlice(context.StringSlice("label"))
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		if err = ListPodSandboxes(runtimeClient, opts); err != nil {
-			return errors.Wrap(err, "listing pod sandboxes")
+
+		opts := &listOptions{
+			id:                 c.String("id"),
+			state:              c.String("state"),
+			verbose:            c.Bool("verbose"),
+			quiet:              c.Bool("quiet"),
+			output:             c.String("output"),
+			latest:             c.Bool("latest"),
+			last:               c.Int("last"),
+			noTrunc:            c.Bool("no-trunc"),
+			nameRegexp:         c.String("name"),
+			podNamespaceRegexp: c.String("namespace"),
 		}
+
+		opts.labels, err = parseLabelStringSlice(c.StringSlice("label"))
+		if err != nil {
+			return err
+		}
+
+		if err = OutputPodSandboxes(c.Context, runtimeClient, opts); err != nil {
+			return fmt.Errorf("listing pod sandboxes: %w", err)
+		}
+
 		return nil
 	},
 }
 
 // RunPodSandbox sends a RunPodSandboxRequest to the server, and parses
 // the returned RunPodSandboxResponse.
-func RunPodSandbox(client pb.RuntimeServiceClient, config *pb.PodSandboxConfig, runtime string, timeout time.Duration) (string, error) {
+func RunPodSandbox(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	config *pb.PodSandboxConfig,
+	runtime string,
+) (string, error) {
 	request := &pb.RunPodSandboxRequest{
 		Config:         config,
 		RuntimeHandler: runtime,
 	}
 	logrus.Debugf("RunPodSandboxRequest: %v", request)
-	ctx, cancel := ctxWithTimeout(timeout)
-	defer cancel()
-	r, err := client.RunPodSandbox(ctx, request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) (string, error) {
+		return client.RunPodSandbox(ctx, config, runtime)
+	})
 	logrus.Debugf("RunPodSandboxResponse: %v", r)
+
 	if err != nil {
 		return "", err
 	}
-	return r.PodSandboxId, nil
+
+	return r, nil
 }
 
 // StopPodSandbox sends a StopPodSandboxRequest to the server, and parses
 // the returned StopPodSandboxResponse.
-func StopPodSandbox(client pb.RuntimeServiceClient, ID string) error {
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
+func StopPodSandbox(ctx context.Context, client internalapi.RuntimeService, id string) error {
+	if id == "" {
+		return errIDEmpty
 	}
-	request := &pb.StopPodSandboxRequest{PodSandboxId: ID}
-	logrus.Debugf("StopPodSandboxRequest: %v", request)
-	r, err := client.StopPodSandbox(context.Background(), request)
-	logrus.Debugf("StopPodSandboxResponse: %v", r)
-	if err != nil {
+
+	logrus.Debugf("Stopping pod sandbox: %s", id)
+
+	if _, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, client.StopPodSandbox(ctx, id)
+	}); err != nil {
 		return err
 	}
 
-	fmt.Printf("Stopped sandbox %s\n", ID)
+	fmt.Printf("Stopped sandbox %s\n", id)
+
 	return nil
 }
 
 // RemovePodSandbox sends a RemovePodSandboxRequest to the server, and parses
 // the returned RemovePodSandboxResponse.
-func RemovePodSandbox(client pb.RuntimeServiceClient, ID string) error {
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
+func RemovePodSandbox(ctx context.Context, client internalapi.RuntimeService, id string) error {
+	if id == "" {
+		return errIDEmpty
 	}
-	request := &pb.RemovePodSandboxRequest{PodSandboxId: ID}
-	logrus.Debugf("RemovePodSandboxRequest: %v", request)
-	r, err := client.RemovePodSandbox(context.Background(), request)
-	logrus.Debugf("RemovePodSandboxResponse: %v", r)
-	if err != nil {
+
+	logrus.Debugf("Removing pod sandbox: %s", id)
+
+	if _, err := InterruptableRPC(ctx, func(ctx context.Context) (any, error) {
+		return nil, client.RemovePodSandbox(ctx, id)
+	}); err != nil {
 		return err
 	}
-	fmt.Printf("Removed sandbox %s\n", ID)
+
+	fmt.Printf("Removed sandbox %s\n", id)
+
 	return nil
 }
 
@@ -379,102 +457,125 @@ func marshalPodSandboxStatus(ps *pb.PodSandboxStatus) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	jsonMap := make(map[string]interface{})
+
+	jsonMap := make(map[string]any)
+
 	err = json.Unmarshal([]byte(statusStr), &jsonMap)
 	if err != nil {
 		return "", err
 	}
-	jsonMap["createdAt"] = time.Unix(0, ps.CreatedAt).Format(time.RFC3339Nano)
-	return marshalMapInOrder(jsonMap, *ps)
+
+	jsonMap["createdAt"] = time.Unix(0, ps.GetCreatedAt()).Format(time.RFC3339Nano)
+
+	return marshalMapInOrder(jsonMap, ps)
 }
 
-// PodSandboxStatus sends a PodSandboxStatusRequest to the server, and parses
+// podSandboxStatus sends a PodSandboxStatusRequest to the server, and parses
 // the returned PodSandboxStatusResponse.
-func PodSandboxStatus(client pb.RuntimeServiceClient, ID, output string, quiet bool, tmplStr string) error {
-	verbose := !(quiet)
-	if output == "" { // default to json output
-		output = "json"
-	}
-	if ID == "" {
-		return fmt.Errorf("ID cannot be empty")
-	}
+func podSandboxStatus(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	ids []string,
+	output string,
+	quiet bool,
+	tmplStr string,
+) error {
+	return resourceStatus(
+		ctx, ids, output, tmplStr, quiet,
+		func(ctx context.Context, id string, verbose bool) (*pb.PodSandboxStatusResponse, error) {
+			r, err := InterruptableRPC(
+				ctx,
+				func(ctx context.Context) (*pb.PodSandboxStatusResponse, error) {
+					return client.PodSandboxStatus(ctx, id, verbose)
+				},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("get pod sandbox status: %w", err)
+			}
 
-	request := &pb.PodSandboxStatusRequest{
-		PodSandboxId: ID,
-		Verbose:      verbose,
-	}
-	logrus.Debugf("PodSandboxStatusRequest: %v", request)
-	r, err := client.PodSandboxStatus(context.Background(), request)
-	logrus.Debugf("PodSandboxStatusResponse: %v", r)
-	if err != nil {
-		return err
-	}
+			return r, nil
+		},
+		func(r *pb.PodSandboxStatusResponse) (string, error) {
+			s, err := marshalPodSandboxStatus(r.GetStatus())
+			if err != nil {
+				return "", fmt.Errorf("marshal pod sandbox status: %w", err)
+			}
 
-	status, err := marshalPodSandboxStatus(r.Status)
-	if err != nil {
-		return err
-	}
-	switch output {
-	case "json", "yaml", "go-template":
-		return outputStatusInfo(status, r.Info, output, tmplStr)
-	case "table": // table output is after this switch block
-	default:
-		return fmt.Errorf("output option cannot be %s", output)
-	}
+			return s, nil
+		},
+		outputPodSandboxStatusTable,
+	)
+}
 
+func outputPodSandboxStatusTable(r *pb.PodSandboxStatusResponse, verbose bool) {
 	// output in table format by default.
-	fmt.Printf("ID: %s\n", r.Status.Id)
-	if r.Status.Metadata != nil {
-		if r.Status.Metadata.Name != "" {
-			fmt.Printf("Name: %s\n", r.Status.Metadata.Name)
-		}
-		if r.Status.Metadata.Uid != "" {
-			fmt.Printf("UID: %s\n", r.Status.Metadata.Uid)
-		}
-		if r.Status.Metadata.Namespace != "" {
-			fmt.Printf("Namespace: %s\n", r.Status.Metadata.Namespace)
-		}
-		fmt.Printf("Attempt: %v\n", r.Status.Metadata.Attempt)
-	}
-	fmt.Printf("Status: %s\n", r.Status.State)
-	ctm := time.Unix(0, r.Status.CreatedAt)
-	fmt.Printf("Created: %v\n", ctm)
+	fmt.Printf("ID: %s\n", r.GetStatus().GetId())
 
-	if r.Status.Network != nil {
-		fmt.Printf("IP Addresses: %v\n", r.Status.Network.Ip)
-		for _, ip := range r.Status.Network.AdditionalIps {
-			fmt.Printf("Additional IP: %v\n", ip.Ip)
+	if r.GetStatus().GetMetadata() != nil {
+		if r.GetStatus().GetMetadata().GetName() != "" {
+			fmt.Printf("Name: %s\n", r.GetStatus().GetMetadata().GetName())
+		}
+
+		if r.GetStatus().GetMetadata().GetUid() != "" {
+			fmt.Printf("UID: %s\n", r.GetStatus().GetMetadata().GetUid())
+		}
+
+		if r.GetStatus().GetMetadata().GetNamespace() != "" {
+			fmt.Printf("Namespace: %s\n", r.GetStatus().GetMetadata().GetNamespace())
+		}
+
+		fmt.Printf("Attempt: %v\n", r.GetStatus().GetMetadata().GetAttempt())
+	}
+
+	fmt.Printf("Status: %s\n", r.GetStatus().GetState())
+	ctm := time.Unix(0, r.GetStatus().GetCreatedAt())
+	fmt.Printf("Created: %v\n", units.HumanDuration(time.Now().UTC().Sub(ctm))+" ago")
+
+	if r.GetStatus().GetNetwork() != nil {
+		fmt.Printf("IP Addresses: %v\n", r.GetStatus().GetNetwork().GetIp())
+
+		for _, ip := range r.GetStatus().GetNetwork().GetAdditionalIps() {
+			fmt.Printf("Additional IP: %v\n", ip.GetIp())
 		}
 	}
+
 	if r.Status.Labels != nil {
 		fmt.Println("Labels:")
-		for _, k := range getSortedKeys(r.Status.Labels) {
-			fmt.Printf("\t%s -> %s\n", k, r.Status.Labels[k])
+
+		for _, k := range getSortedKeys(r.GetStatus().GetLabels()) {
+			fmt.Printf("\t%s -> %s\n", k, r.GetStatus().GetLabels()[k])
 		}
 	}
+
 	if r.Status.Annotations != nil {
 		fmt.Println("Annotations:")
-		for _, k := range getSortedKeys(r.Status.Annotations) {
-			fmt.Printf("\t%s -> %s\n", k, r.Status.Annotations[k])
+
+		for _, k := range getSortedKeys(r.GetStatus().GetAnnotations()) {
+			fmt.Printf("\t%s -> %s\n", k, r.GetStatus().GetAnnotations()[k])
 		}
 	}
+
 	if verbose {
 		fmt.Printf("Info: %v\n", r.GetInfo())
 	}
-
-	return nil
 }
 
 // ListPodSandboxes sends a ListPodSandboxRequest to the server, and parses
 // the returned ListPodSandboxResponse.
-func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
+func ListPodSandboxes(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	opts *listOptions,
+) ([]*pb.PodSandbox, error) {
 	filter := &pb.PodSandboxFilter{}
 	if opts.id != "" {
 		filter.Id = opts.id
 	}
+
 	if opts.state != "" {
 		st := &pb.PodSandboxStateValue{}
 		st.State = pb.PodSandboxState_SANDBOX_NOTREADY
+
 		switch strings.ToLower(opts.state) {
 		case "ready":
 			st.State = pb.PodSandboxState_SANDBOX_READY
@@ -483,35 +584,55 @@ func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
 			st.State = pb.PodSandboxState_SANDBOX_NOTREADY
 			filter.State = st
 		default:
-			log.Fatalf("--state should be ready or notready")
+			return nil, errors.New("--state should be ready or notready")
 		}
 	}
+
 	if opts.labels != nil {
 		filter.LabelSelector = opts.labels
 	}
+
 	request := &pb.ListPodSandboxRequest{
 		Filter: filter,
 	}
 	logrus.Debugf("ListPodSandboxRequest: %v", request)
-	r, err := client.ListPodSandbox(context.Background(), request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) ([]*pb.PodSandbox, error) {
+		return client.ListPodSandbox(ctx, filter)
+	})
 	logrus.Debugf("ListPodSandboxResponse: %v", r)
+
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("call list sandboxes RPC: %w", err)
 	}
-	r.Items = getSandboxesList(r.GetItems(), opts)
+
+	return getSandboxesList(r, opts)
+}
+
+// OutputPodSandboxes sends a ListPodSandboxRequest to the server, and parses
+// the returned ListPodSandboxResponse for output.
+func OutputPodSandboxes(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	opts *listOptions,
+) error {
+	r, err := ListPodSandboxes(ctx, client, opts)
+	if err != nil {
+		return fmt.Errorf("list pod sandboxes: %w", err)
+	}
 
 	switch opts.output {
-	case "json":
-		return outputProtobufObjAsJSON(r)
-	case "yaml":
-		return outputProtobufObjAsYAML(r)
-	case "table":
+	case outputTypeJSON:
+		return outputProtobufObjAsJSON(&pb.ListPodSandboxResponse{Items: r})
+	case outputTypeYAML:
+		return outputProtobufObjAsYAML(&pb.ListPodSandboxResponse{Items: r})
+	case outputTypeTable:
 	// continue; output will be generated after the switch block ends.
 	default:
 		return fmt.Errorf("unsupported output format %q", opts.output)
 	}
 
-	display := newTableDisplay(20, 1, 3, ' ', 0)
+	display := newDefaultTableDisplay()
 	if !opts.verbose && !opts.quiet {
 		display.AddRow([]string{
 			columnPodID,
@@ -523,114 +644,144 @@ func ListPodSandboxes(client pb.RuntimeServiceClient, opts listOptions) error {
 			columnPodRuntime,
 		})
 	}
-	for _, pod := range r.Items {
+
+	c := cases.Title(language.Und)
+
+	for _, pod := range r {
 		if opts.quiet {
-			fmt.Printf("%s\n", pod.Id)
-			continue
-		}
-		if !opts.verbose {
-			createdAt := time.Unix(0, pod.CreatedAt)
-			ctm := units.HumanDuration(time.Now().UTC().Sub(createdAt)) + " ago"
-			id := pod.Id
-			if !opts.noTrunc {
-				id = getTruncatedID(id, "")
-			}
-			display.AddRow([]string{
-				id,
-				ctm,
-				convertPodState(pod.State),
-				pod.Metadata.Name,
-				pod.Metadata.Namespace,
-				fmt.Sprintf("%d", pod.Metadata.Attempt),
-				getSandboxesRuntimeHandler(pod),
-			})
+			fmt.Printf("%s\n", pod.GetId())
+
 			continue
 		}
 
-		fmt.Printf("ID: %s\n", pod.Id)
-		if pod.Metadata != nil {
-			if pod.Metadata.Name != "" {
-				fmt.Printf("Name: %s\n", pod.Metadata.Name)
+		if !opts.verbose {
+			createdAt := time.Unix(0, pod.GetCreatedAt())
+			ctm := units.HumanDuration(time.Now().UTC().Sub(createdAt)) + " ago"
+
+			id := pod.GetId()
+			if !opts.noTrunc {
+				id = getTruncatedID(id, "")
 			}
-			if pod.Metadata.Uid != "" {
-				fmt.Printf("UID: %s\n", pod.Metadata.Uid)
+
+			podState, err := convertPodState(pod.GetState())
+			if err != nil {
+				return err
 			}
-			if pod.Metadata.Namespace != "" {
-				fmt.Printf("Namespace: %s\n", pod.Metadata.Namespace)
+
+			display.AddRow([]string{
+				id,
+				ctm,
+				podState,
+				pod.GetMetadata().GetName(),
+				pod.GetMetadata().GetNamespace(),
+				strconv.FormatUint(uint64(pod.GetMetadata().GetAttempt()), 10),
+				getSandboxesRuntimeHandler(pod),
+			})
+
+			continue
+		}
+
+		fmt.Printf("ID: %s\n", pod.GetId())
+
+		if pod.GetMetadata() != nil {
+			if pod.GetMetadata().GetName() != "" {
+				fmt.Printf("Name: %s\n", pod.GetMetadata().GetName())
 			}
-			if pod.Metadata.Attempt != 0 {
-				fmt.Printf("Attempt: %v\n", pod.Metadata.Attempt)
+
+			if pod.GetMetadata().GetUid() != "" {
+				fmt.Printf("UID: %s\n", pod.GetMetadata().GetUid())
+			}
+
+			if pod.GetMetadata().GetNamespace() != "" {
+				fmt.Printf("Namespace: %s\n", pod.GetMetadata().GetNamespace())
+			}
+
+			if pod.GetMetadata().GetAttempt() != 0 {
+				fmt.Printf("Attempt: %v\n", pod.GetMetadata().GetAttempt())
 			}
 		}
-		fmt.Printf("Status: %s\n", convertPodState(pod.State))
-		ctm := time.Unix(0, pod.CreatedAt)
+
+		podState, err := convertPodState(pod.GetState())
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Status: %s\n", podState)
+
+		ctm := time.Unix(0, pod.GetCreatedAt())
 		fmt.Printf("Created: %v\n", ctm)
+
 		if pod.Labels != nil {
 			fmt.Println("Labels:")
-			for _, k := range getSortedKeys(pod.Labels) {
-				fmt.Printf("\t%s -> %s\n", k, pod.Labels[k])
+
+			for _, k := range getSortedKeys(pod.GetLabels()) {
+				fmt.Printf("\t%s -> %s\n", k, pod.GetLabels()[k])
 			}
 		}
+
 		if pod.Annotations != nil {
 			fmt.Println("Annotations:")
-			for _, k := range getSortedKeys(pod.Annotations) {
-				fmt.Printf("\t%s -> %s\n", k, pod.Annotations[k])
+
+			for _, k := range getSortedKeys(pod.GetAnnotations()) {
+				fmt.Printf("\t%s -> %s\n", k, pod.GetAnnotations()[k])
 			}
 		}
+
 		fmt.Printf("%s: %s\n",
-			strings.Title(strings.ToLower(columnPodRuntime)),
+			c.String(columnPodRuntime),
 			getSandboxesRuntimeHandler(pod))
 
 		fmt.Println()
 	}
 
 	display.Flush()
+
 	return nil
 }
 
-func convertPodState(state pb.PodSandboxState) string {
+func convertPodState(state pb.PodSandboxState) (string, error) {
 	switch state {
 	case pb.PodSandboxState_SANDBOX_READY:
-		return "Ready"
+		return "Ready", nil
 	case pb.PodSandboxState_SANDBOX_NOTREADY:
-		return "NotReady"
+		return "NotReady", nil
 	default:
-		log.Fatalf("Unknown pod state %q", state)
-		return ""
+		return "", fmt.Errorf("unknown pod state %q", state)
 	}
 }
 
 func getSandboxesRuntimeHandler(sandbox *pb.PodSandbox) string {
-	if sandbox.RuntimeHandler == "" {
+	if sandbox.GetRuntimeHandler() == "" {
 		return "(default)"
 	}
-	return sandbox.RuntimeHandler
+
+	return sandbox.GetRuntimeHandler()
 }
 
-func getSandboxesList(sandboxesList []*pb.PodSandbox, opts listOptions) []*pb.PodSandbox {
+func getSandboxesList(sandboxesList []*pb.PodSandbox, opts *listOptions) ([]*pb.PodSandbox, error) {
+	nameRe, err := compileRegex(opts.nameRegexp)
+	if err != nil {
+		return nil, err
+	}
+
+	nsRe, err := compileRegex(opts.podNamespaceRegexp)
+	if err != nil {
+		return nil, err
+	}
+
 	filtered := []*pb.PodSandbox{}
+
 	for _, p := range sandboxesList {
 		// Filter by pod name/namespace regular expressions.
-		if matchesRegex(opts.nameRegexp, p.Metadata.Name) &&
-			matchesRegex(opts.podNamespaceRegexp, p.Metadata.Namespace) {
+		if p.GetMetadata() != nil && matchesRegex(nameRe, p.GetMetadata().GetName()) &&
+			matchesRegex(nsRe, p.GetMetadata().GetNamespace()) {
 			filtered = append(filtered, p)
 		}
 	}
 
-	sort.Sort(sandboxByCreated(filtered))
-	n := len(filtered)
-	if opts.latest {
-		n = 1
-	}
-	if opts.last > 0 {
-		n = opts.last
-	}
-	n = func(a, b int) int {
-		if a < b {
-			return a
-		}
-		return b
-	}(n, len(filtered))
+	slices.SortFunc(filtered, func(a, b *pb.PodSandbox) int {
+		return cmp.Compare(b.GetCreatedAt(), a.GetCreatedAt()) // descending
+	})
 
-	return filtered[:n]
+	return filtered[:truncateCount(len(filtered), opts.latest, opts.last)], nil
 }

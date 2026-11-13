@@ -14,131 +14,360 @@
 
 MAKEFLAGS += --no-print-directory
 GO ?= go
+NPX ?= npx
 
-# test for go module support
-ifeq ($(shell go help mod >/dev/null 2>&1 && echo true), true)
-export GO_BUILD=GO111MODULE=on $(GO) build -mod=vendor
-export GO_TEST=GO111MODULE=on $(GO) test -mod=vendor
-else
-export GO_BUILD=$(GO) build
-export GO_TEST=$(GO) test
-endif
-
-GOOS := $(shell $(GO) env GOOS)
+GOARCH ?= $(shell $(GO) env GOARCH)
+GOOS ?= $(shell $(GO) env GOOS)
 ifeq ($(GOOS),windows)
 	BIN_EXT := .exe
 endif
 
-PROJECT := github.com/kubernetes-sigs/cri-tools
+export GO_BUILD=GOARCH=$(GOARCH) GOOS=$(GOOS) $(GO) build -mod=vendor
+export GO_TEST=GOARCH=$(GOARCH) GOOS=$(GOOS) $(GO) test -mod=vendor
+
+PROJECT := sigs.k8s.io/cri-tools
 BINDIR ?= /usr/local/bin
 
-VERSION := $(shell git describe --tags --dirty --always)
-VERSION := $(VERSION:v%=%)
-GO_LDFLAGS := -X $(PROJECT)/pkg/version.Version=$(VERSION)
-BUILDTAGS := selinux
+VERSION ?= $(shell git describe --tags --dirty --always | sed 's/^v//')
+CGO_ENABLED ?= 0
+GOFLAGS ?= -trimpath
+GO_LDFLAGS := $(GO_LDFLAGS) -X $(PROJECT)/pkg/version.Version=$(VERSION)
+export GOFLAGS
 
 BUILD_PATH := $(shell pwd)/build
-BUILD_BIN_PATH := $(BUILD_PATH)/bin
+BUILD_BIN_PATH := $(BUILD_PATH)/bin/$(GOOS)/$(GOARCH)
 
 define go-build
 	$(shell cd `pwd` && $(GO_BUILD) -o $(BUILD_BIN_PATH)/$(shell basename $(1)) $(1))
 	@echo > /dev/null
 endef
 
+define curl_to
+	curl -sSfL --retry 5 --retry-delay 3 "$(1)" -o $(2)
+	chmod +x $(2)
+endef
+
+ZEITGEIST_VERSION = v0.8.0
+GOLANGCI_LINT_VERSION := v2.13.2
+REPO_INFRA_VERSION = v0.2.6
+PRETTIER_VERSION = 3.9.6
+ZIZMOR_VERSION := v1.30.0
+
 GINKGO := $(BUILD_BIN_PATH)/ginkgo
-GOLANGCI_LINT := $(BUILD_BIN_PATH)/golangci-lint
+GOLANGCI_LINT_DIR := $(BUILD_BIN_PATH)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GOLANGCI_LINT := $(GOLANGCI_LINT_DIR)/golangci-lint
+ZEITGEIST := $(BUILD_BIN_PATH)/zeitgeist
+ZIZMOR_DIR := $(BUILD_BIN_PATH)/zizmor-$(ZIZMOR_VERSION)
+ZIZMOR := $(ZIZMOR_DIR)/zizmor
+VERIFY_BOILERPLATE := $(BUILD_BIN_PATH)/verify_boilerplate.py
 
 CRITEST := $(BUILD_BIN_PATH)/critest$(BIN_EXT)
 CRICTL := $(BUILD_BIN_PATH)/crictl$(BIN_EXT)
+CRICTL_E2E := $(BUILD_BIN_PATH)/crictl-e2e$(BIN_EXT)
 
 all: binaries
 
-help:
-	@echo "Usage: make <target>"
-	@echo
-	@echo " * 'install' - Install binaries to system locations."
-	@echo " * 'binaries' - Build critest and crictl."
-	@echo " * 'clean' - Clean artifacts."
+COLOR:=\\033[36m
+NOCOLOR:=\\033[0m
+WIDTH:=30
 
-critest:
+.PHONY: help
+help: ## Display this help.
+	@awk \
+		-v "col=${COLOR}" -v "nocol=${NOCOLOR}" \
+		' \
+			BEGIN { \
+				FS = ":.*##" ; \
+				printf "Usage:\n  make %s<target>%s\n", col, nocol \
+			} \
+			/^[./a-zA-Z0-9_-]+:.*?##/ { \
+				printf "  %s%-${WIDTH}s%s %s\n", col, $$1, nocol, $$2 \
+			} \
+			/^##@/ { \
+				printf "\n%s\n", substr($$0, 5) \
+			} \
+		' $(MAKEFILE_LIST)
+
+##@ Build targets:
+
+.PHONY: binaries
+binaries: critest crictl ## Build the critest and crictl binaries.
+
+.PHONY: critest
+critest: ## Build the critest binary.
 	@$(MAKE) -B $(CRITEST)
 
 $(CRITEST):
-	CGO_ENABLED=0 $(GO_TEST) -c -o $@ \
+	CGO_ENABLED=$(CGO_ENABLED) $(GO_TEST) -c -o $@ \
 		-ldflags '$(GO_LDFLAGS)' \
-		-tags '$(BUILDTAGS)' \
 	     $(PROJECT)/cmd/critest
 
-crictl:
+.PHONY: crictl-e2e
+crictl-e2e: ## Build the crictl-e2e binary.
+	@$(MAKE) -B $(CRICTL_E2E)
+
+$(CRICTL_E2E):
+	CGO_ENABLED=$(CGO_ENABLED) $(GO_TEST) -c -o $@ \
+		-ldflags '$(GO_LDFLAGS)' \
+		$(GOFLAGS) \
+	     $(PROJECT)/test/e2e
+
+.PHONY: crictl
+crictl: ## Build the crictl binary.
 	@$(MAKE) -B $(CRICTL)
 
 $(CRICTL):
-	CGO_ENABLED=0 $(GO_BUILD) -o $@ \
+	CGO_ENABLED=$(CGO_ENABLED) $(GO_BUILD) -o $@ \
 		-ldflags '$(GO_LDFLAGS)' \
-		-tags '$(BUILDTAGS)' \
 		$(PROJECT)/cmd/crictl
 
-clean:
+.PHONY: clean
+clean: ## Clean the repository.
 	find . -name \*~ -delete
 	find . -name \#\* -delete
 	rm -rf $(BUILD_PATH)
 
-binaries: critest crictl
 
-install: $(CRITEST) $(CRICTL)
+.PHONY: install
+install: $(CRITEST) $(CRICTL) ## Install critest and crictl.
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $^ $(DESTDIR)$(BINDIR)/
 
-lint: $(GOLANGCI_LINT)
-	$(GOLANGCI_LINT) run
-	./hack/repo-infra/verify/verify-boilerplate.sh
-
-install.tools: $(GINKGO) $(GOLANGCI_LINT)
-
-install.ginkgo: $(GINKGO)
-install.lint: $(GOLANGCI_LINT)
-
-$(GOLANGCI_LINT):
-	export \
-		VERSION=v1.32.2 \
-		URL=https://raw.githubusercontent.com/golangci/golangci-lint \
-		BINDIR=${BUILD_BIN_PATH} && \
-	curl -sfL $$URL/$$VERSION/install.sh | sh -s $$VERSION
-
-
-$(GINKGO):
-	$(call go-build,./vendor/github.com/onsi/ginkgo/ginkgo)
-
-release:
+.PHONY: release
+release: ## Build a release.
 	hack/release.sh
 
-# needs to run as root to work
-test-e2e: $(GINKGO)
+##@ Verify targets:
+
+.PHONY: verify
+verify: verify-lint verify-boilerplate verify-docs verify-dependencies verify-go-modules verify-prettier verify-zizmor ## Run all verify targets.
+
+.PHONY: verify-lint
+verify-lint: $(GOLANGCI_LINT) ## Run golangci-lint for the current OS, linux, and windows.
+	$(GOLANGCI_LINT) run
+ifneq ($(GOOS),linux)
+	GOOS=linux $(GOLANGCI_LINT) run
+endif
+ifneq ($(GOOS),windows)
+	GOOS=windows $(GOLANGCI_LINT) run
+endif
+
+.PHONY: lint-fix
+lint-fix: $(GOLANGCI_LINT) ## Run golangci-lint with fix for the current OS, linux, and windows.
+	$(GOLANGCI_LINT) run --fix
+ifneq ($(GOOS),linux)
+	GOOS=linux $(GOLANGCI_LINT) run --fix
+endif
+ifneq ($(GOOS),windows)
+	GOOS=windows $(GOLANGCI_LINT) run --fix
+endif
+
+.PHONY: verify-prettier
+verify-prettier: ## Run prettier check.
+	# skip check if npx is not available since it is not a standard
+	# tool for go developers and may not be installed in the environment
+	@if $(NPX) --version >/dev/null 2>&1; then \
+		$(NPX) prettier@$(PRETTIER_VERSION) --check .; \
+	else \
+		echo "npx not found. Skipping prettier check."; \
+	fi
+
+.PHONY: prettier-fix
+prettier-fix: ## Run prettier with write.
+	$(NPX) prettier@$(PRETTIER_VERSION) --write .
+
+.PHONY: verify-boilerplate
+verify-boilerplate: $(VERIFY_BOILERPLATE) ## Verify the boilerplate headers.
+	$(VERIFY_BOILERPLATE) --boilerplate-dir hack/boilerplate
+
+$(BUILD_BIN_PATH):
+	mkdir -p $(BUILD_BIN_PATH)
+
+$(VERIFY_BOILERPLATE): $(BUILD_BIN_PATH)
+	$(call curl_to,https://raw.githubusercontent.com/kubernetes/repo-infra/$(REPO_INFRA_VERSION)/hack/verify_boilerplate.py,$(VERIFY_BOILERPLATE))
+
+.PHONY: verify-docs
+verify-docs: ## Verify the documentation.
+	hack/verify-docs.sh
+
+.PHONY: verify-dependencies
+verify-dependencies: $(BUILD_BIN_PATH)/zeitgeist ## Verify third party dependencies.
+	$(ZEITGEIST) validate --local-only --base-path . --config dependencies.yaml
+
+$(ZEITGEIST): $(BUILD_BIN_PATH)
+	$(call curl_to,https://github.com/kubernetes-sigs/zeitgeist/releases/download/$(ZEITGEIST_VERSION)/zeitgeist-$(GOARCH)-$(GOOS),$(ZEITGEIST))
+
+.PHONY: verify-zizmor
+verify-zizmor: $(ZIZMOR) ## Run zizmor on .github/workflows/.
+	@if [ -x "$(ZIZMOR)" ]; then \
+		$(ZIZMOR) .github/workflows/; \
+	else \
+		echo "Skipping verify-zizmor: no zizmor binary for $(GOOS)/$(GOARCH)."; \
+	fi
+
+$(ZIZMOR): $(BUILD_BIN_PATH)
+	@set -e; \
+	case "$(GOOS)/$(GOARCH)" in \
+		linux/amd64)  target=x86_64-unknown-linux-gnu  ;; \
+		linux/arm64)  target=aarch64-unknown-linux-gnu ;; \
+		darwin/amd64) target=x86_64-apple-darwin       ;; \
+		darwin/arm64) target=aarch64-apple-darwin      ;; \
+		*) echo "skipping zizmor install: unsupported host $(GOOS)/$(GOARCH)" >&2; touch $(ZIZMOR); exit 0 ;; \
+	esac; \
+	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	curl -sSfL --retry 5 --retry-delay 3 \
+		"https://github.com/zizmorcore/zizmor/releases/download/$(ZIZMOR_VERSION)/zizmor-$$target.tar.gz" \
+		-o "$$tmp"; \
+	mkdir -p $(ZIZMOR_DIR); \
+	tar -xzf "$$tmp" -C $(ZIZMOR_DIR) zizmor; \
+	chmod +x $(ZIZMOR); \
+	touch $(ZIZMOR)
+
+.PHONY: verify-go-modules
+verify-go-modules: ## Verify vendored golang modules.
+	hack/verify-go-modules.sh
+
+##@ Test targets:
+
+# Containerd git ref built into the local containerized test image. Mirrors
+# CI's primary matrix entry (main). Override to test other refs, e.g.
+# make test-critest-containerd CONTAINERD_VERSION=release/2.3
+CONTAINERD_VERSION ?= main
+
+# runc flavor built into the image (runc or crun) and the containerd runtime
+# handler used by the generated config. Defaults mirror CI's primary matrix
+# entry. Override via, e.g. RUNC_FLAVOR=crun.
+RUNC_FLAVOR ?= runc
+RUNTIME ?= io.containerd.runc.v2
+
+# NRI is enabled by default for all supported containerd versions (2.x+).
+# ENABLE_NRI=false also skips the NRI config in hack/setup-containerd.sh, so the
+# --nri-socket flag has to be dropped along with it. The flag is
+# critest-specific and must not be passed to other test binaries.
+ENABLE_NRI ?= true
+
+NRI_FLAGS :=
+ifeq ($(ENABLE_NRI),true)
+NRI_FLAGS := --nri-socket=/var/run/nri/nri.sock
+endif
+
+# critest parallelism, mirrors CI's --parallel=8. Override via PARALLEL=N.
+PARALLEL ?= 8
+
+# Each test suite gets its own containerd data volume, named after the test
+# binary, so that one suite does not drop images or runtime state cached by
+# another. Override via DATA_VOLUME_SUFFIX=foo to run a suite against a
+# separate volume.
+
+.PHONY: test-e2e
+test-e2e: $(GINKGO) ## Run the e2e test suite.
+	$(GINKGO) \
+		-r \
+		--randomize-all \
+		--randomize-suites \
+		--race \
+		--vv \
+		test \
+		-- \
+		$(TESTFLAGS)
+
+.PHONY: test-critest-containerd
+test-critest-containerd: ## Run the critest in a container with containerd (set CONTAINERD_VERSION=main|release/2.3, RUNC_FLAVOR, RUNTIME; images are cached per version and suite).
+	# AppArmor tests must be skipped as the containerized environment does not support them.
+	# Skip Slow tests by default; override with TESTFLAGS='--ginkgo.label-filter=""' to include them.
+	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
+	RUNC_FLAVOR=$(RUNC_FLAVOR) \
+	RUNTIME=$(RUNTIME) \
+	hack/run-e2e-container.sh /usr/local/bin/critest-tools/critest \
+		--runtime-endpoint=unix:///run/containerd/containerd.sock \
+		--parallel=$(PARALLEL) \
+		--ginkgo.vv \
+		--ginkgo.skip="AppArmor" \
+		--ginkgo.label-filter="!Slow" \
+		$(NRI_FLAGS) \
+		$(TESTFLAGS)
+
+.PHONY: test-crictl-e2e-containerd
+test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd (set CONTAINERD_VERSION=main|release/2.3, RUNC_FLAVOR, RUNTIME; images are cached per version and suite).
+	# AppArmor tests must be skipped as the containerized environment does not support them.
+	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
+	RUNC_FLAVOR=$(RUNC_FLAVOR) \
+	RUNTIME=$(RUNTIME) \
+	hack/run-e2e-container.sh /usr/local/bin/critest-tools/crictl-e2e \
+		-crictl-binary-path=/usr/local/bin/critest-tools/crictl \
+		-crictl-runtime-endpoint=unix:///run/containerd/containerd.sock \
+		--ginkgo.vv \
+		--ginkgo.skip="AppArmor" \
+		$(TESTFLAGS)
+
+.PHONY: clean-containerd-test-images
+clean-containerd-test-images: ## Remove cached containerd-local-test images and data volumes so they are regenerated.
+	# Remove all per-version containerd-local-test images. Guard the empty case
+	# without GNU-only `xargs -r` so the target also works on macOS/BSD.
+	images=$$(docker images --filter=reference='containerd-local-test:*' -q | sort -u); \
+	if [ -n "$$images" ]; then docker rmi -f $$images; fi
+	# Remove the per-version, per-suite named data volumes (containerd-local-test-data-*).
+	volumes=$$(docker volume ls --filter=name='containerd-local-test-data' -q); \
+	if [ -n "$$volumes" ]; then docker volume rm -f $$volumes; fi
+
+.PHONY: test-crictl
+test-crictl: $(GINKGO) ## Run the crictl test suite.
+	# Run go test for templates_test.go and util_test.go
+	CGO_ENABLED=$(CGO_ENABLED) $(GO_TEST) \
+		-ldflags '$(GO_LDFLAGS)' \
+		$(PROJECT)/cmd/crictl
 	$(GINKGO) $(TESTFLAGS) \
 		-r -p \
-		--randomizeAllSpecs \
-		--randomizeSuites \
-		--succinct \
-		--slowSpecThreshold 60 \
-		test
+		--randomize-all \
+		--randomize-suites \
+		--poll-progress-after 60s \
+		cmd/crictl
 
-vendor:
-	export GO111MODULE=on GOSUMDB= && \
+##@ Utility targets:
+
+.PHONY: install.tools
+install.tools: $(GINKGO) $(GOLANGCI_LINT) $(ZIZMOR) ## Install all required verification tools.
+
+.PHONY: install.ginkgo
+install.ginkgo: $(GINKGO) ## Install ginkgo.
+
+$(GINKGO):
+	$(call go-build,./vendor/github.com/onsi/ginkgo/v2/ginkgo)
+
+.PHONY: install.lint
+install.lint: $(GOLANGCI_LINT) ## Install golangci-lint.
+
+.PHONY: install.zizmor
+install.zizmor: $(ZIZMOR) ## Install zizmor.
+
+.PHONY: install.prettier
+install.prettier: ## Install prettier.
+	npm install prettier@$(PRETTIER_VERSION)
+
+$(GOLANGCI_LINT):
+	mkdir -p $(GOLANGCI_LINT_DIR)
+	export \
+		VERSION=$(GOLANGCI_LINT_VERSION) \
+		URL=https://raw.githubusercontent.com/golangci/golangci-lint \
+		BINDIR=$(GOLANGCI_LINT_DIR) && \
+	curl -sfL $$URL/$$VERSION/install.sh | sh -s $$VERSION
+	ln -sf $(GOLANGCI_LINT) $(BUILD_BIN_PATH)/golangci-lint
+
+.PHONY: vendor
+vendor: ## Update vendored golang modules.
+	export GOSUMDB= && \
 		$(GO) mod tidy && \
 		$(GO) mod vendor && \
 		$(GO) mod verify
 
-.PHONY: \
-	help \
-	critest \
-	crictl \
-	clean \
-	binaries \
-	install \
-	lint \
-	install.tools \
-	install.ginkgo \
-	install.lint \
-	release \
-	test-e2e \
-	vendor
+CRICTL_MAN ?= $(CURDIR)/docs/crictl.1
+
+.PHONY: docs
+docs: ## Regenerate the crictl man page.
+	$(GO) run -C hack/tools github.com/cpuguy83/go-md2man/v2 \
+		-in "$(CURDIR)/docs/crictl.md" -out "$(CRICTL_MAN)"
+
+.PHONY: release-notes
+release-notes: ## Build the release notes.
+	hack/release-notes.sh

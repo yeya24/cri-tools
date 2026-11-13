@@ -1,87 +1,108 @@
 name: build
-on: [push, pull_request]
-jobs:
-  linters:
-    name: lint and vendor check/ on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+on:
+  push:
+    tags:
+      - "*"
+    branches:
+      - master
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+permissions:
+  contents: read
 
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: images/build -d
+
+  linters:
+    name: verify / ${{ matrix.run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
-        os: [ubuntu-18.04]  # TODO: pass linters on 'macos-10.15' and 'windows-2019'
-
+        run:
+          - lint
+          - boilerplate
+          - dependencies
+          - go-modules
+          - docs
+          - zizmor
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.15'
-
-      - name: Set env
-        shell: bash
-        run: |
-          echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
-          echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
-
-      - name: Cache go modules and build cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-            '%LocalAppData%\go-build' # Windows
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: src/github.com/kubernetes-sigs/cri-tools
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make verify-${{ matrix.run }}
 
-      - name: Make check
-        shell: bash
-        run: |
-          make lint
-          hack/verify-go-modules.sh
-        working-directory: src/github.com/kubernetes-sigs/cri-tools
+  test:
+    name: test / crictl
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make test-crictl
 
   releases:
     name: releases / on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     strategy:
       matrix:
-        os: [ubuntu-18.04, macos-10.15]  # TODO: make releases on 'linux-ppc64le' 'windows-2019'
-                                         # Ref: https://github.com/uraimo/run-on-arch-action
+        os:
+          [ubuntu-24.04, macos-latest] # TODO: make releases on 'linux-ppc64le' 'windows-2025'
+          # Ref: https://github.com/uraimo/run-on-arch-action
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.15'
-
-      - name: Set env
-        shell: bash
-        run: |
-          echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
-          echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
-
-      - name: Cache go modules and build cache
-        uses: actions/cache@v2
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-            '%LocalAppData%\go-build' # Windows
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: src/github.com/kubernetes-sigs/cri-tools
           fetch-depth: 0
-
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Make release
-        shell: bash
         run: make release
-        working-directory: src/github.com/kubernetes-sigs/cri-tools
+
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
+        with:
+          config: .typos.toml
+
+  prettier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: creyD/prettier_action@8c18391fdc98ed0d884c6345f03975edac71b8f0 # v4.6
+        with:
+          dry: true
+          prettier_version: 3.9.6
+          prettier_options: --write .

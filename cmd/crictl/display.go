@@ -31,16 +31,21 @@ const (
 	columnState      = "STATE"
 	columnName       = "NAME"
 	columnAttempt    = "ATTEMPT"
+	columnPodName    = "POD"
 	columnPodID      = "POD ID"
 	columnPodRuntime = "RUNTIME"
 	columnNamespace  = "NAMESPACE"
 	columnSize       = "SIZE"
 	columnTag        = "TAG"
+	columnPinned     = "PINNED"
 	columnDigest     = "DIGEST"
 	columnMemory     = "MEM"
 	columnInodes     = "INODES"
+	columnSwap       = "SWAP"
 	columnDisk       = "DISK"
 	columnCPU        = "CPU %"
+	columnKey        = "KEY"
+	columnValue      = "VALUE"
 )
 
 // display use to output something on screen with table format.
@@ -48,9 +53,14 @@ type display struct {
 	w *tabwriter.Writer
 }
 
+func newDefaultTableDisplay() *display {
+	return newTableDisplay(20, 1, 3, ' ', 0)
+}
+
 // newTableDisplay creates a display instance, and uses to format output with table.
 func newTableDisplay(minwidth, tabwidth, padding int, padchar byte, flags uint) *display {
-	w := tabwriter.NewWriter(os.Stdout, minwidth, tabwidth, padding, padchar, 0)
+	w := tabwriter.NewWriter(os.Stdout, minwidth, tabwidth, padding, padchar, flags)
+
 	return &display{w}
 }
 

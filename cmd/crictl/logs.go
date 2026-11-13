@@ -18,17 +18,52 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	timetypes "github.com/docker/docker/api/types/time"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/kubelet/kuberuntime/logs"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/cri-client/pkg/logs"
+
+	"sigs.k8s.io/cri-tools/pkg/timetype"
 )
+
+const (
+	streamStdout = "stdout"
+	streamStderr = "stderr"
+)
+
+// NewLogOptions converts PodLogOptions to LogOptions.
+func NewLogOptions(
+	follow, timestamps bool,
+	since time.Time,
+	tailLines, limitBytes *int64,
+) *logs.LogOptions {
+	res := &logs.LogOptions{
+		Follow:    follow,
+		Timestamp: timestamps,
+	}
+
+	if !since.IsZero() {
+		res.Since = since
+	}
+
+	if tailLines != nil && *tailLines >= 0 {
+		res.TailLines = tailLines
+	}
+
+	if limitBytes != nil && *limitBytes >= 0 {
+		res.LimitBytes = limitBytes
+	}
+
+	return res
+}
 
 var logsCommand = &cli.Command{
 	Name:                   "logs",
@@ -46,6 +81,11 @@ var logsCommand = &cli.Command{
 			Aliases: []string{"p"},
 			Usage:   "Print the logs for the previous instance of the container in a pod if it exists",
 		},
+		&cli.BoolFlag{
+			Name:    "reopen",
+			Aliases: []string{"r"},
+			Usage:   "Reopen the container logs for the provided container",
+		},
 		&cli.Int64Flag{
 			Name:  "tail",
 			Value: -1,
@@ -58,7 +98,6 @@ var logsCommand = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name:  "since",
-			Value: "",
 			Usage: "Show logs since timestamp (e.g. 2013-01-02T13:23:37) or relative (e.g. 42m for 42 minutes)",
 		},
 		&cli.BoolFlag{
@@ -66,66 +105,161 @@ var logsCommand = &cli.Command{
 			Aliases: []string{"t"},
 			Usage:   "Show timestamps",
 		},
+		&cli.StringFlag{
+			Name:    "stream",
+			Aliases: []string{"s"},
+			Usage:   "Show specified stream (stdout or stderr). Defaults to both.",
+		},
 	},
-	Action: func(ctx *cli.Context) error {
-		runtimeService, err := getRuntimeService(ctx)
+	Action: func(c *cli.Context) (retErr error) {
+		containerID := c.Args().First()
+		if containerID == "" {
+			return errIDEmpty
+		}
+
+		if c.NArg() > 1 {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		runtimeService, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
 
-		containerID := ctx.Args().First()
-		if containerID == "" {
-			return fmt.Errorf("ID cannot be empty")
-		}
-		tailLines := ctx.Int64("tail")
-		limitBytes := ctx.Int64("limit-bytes")
-		since, err := parseTimestamp(ctx.String("since"))
-		if err != nil {
-			return err
-		}
-		timestamp := ctx.Bool("timestamps")
-		previous := ctx.Bool("previous")
-		logOptions := logs.NewLogOptions(&v1.PodLogOptions{
-			Follow:     ctx.Bool("follow"),
-			TailLines:  &tailLines,
-			LimitBytes: &limitBytes,
-			SinceTime:  since,
-			Timestamps: timestamp,
-		}, time.Now())
-		status, err := runtimeService.ContainerStatus(containerID)
-		if err != nil {
-			return err
-		}
-		logPath := status.GetLogPath()
-		if logPath == "" {
-			return fmt.Errorf("The container has not set log path")
-		}
-		if previous {
-			containerAttempt := status.GetMetadata().Attempt
-			if containerAttempt == uint32(0) {
-				return fmt.Errorf("Previous terminated container %s not found", status.GetMetadata().Name)
+		if c.Bool("reopen") {
+			if _, err := InterruptableRPC(c.Context, func(ctx context.Context) (any, error) {
+				return nil, runtimeService.ReopenContainerLog(ctx, containerID)
+			}); err != nil {
+				return fmt.Errorf("reopen container logs: %w", err)
 			}
-			logPath = fmt.Sprintf("%s%s%s", logPath[:strings.LastIndex(logPath, "/")+1], fmt.Sprint(containerAttempt-1),
-				logPath[strings.LastIndex(logPath, "."):])
+
+			logrus.Info("Container logs reopened")
 		}
-		return logs.ReadLogs(context.Background(), logPath, status.GetId(), logOptions, runtimeService, os.Stdout, os.Stderr)
+
+		tailLines := c.Int64("tail")
+		limitBytes := c.Int64("limit-bytes")
+
+		since, err := parseTimestamp(c.String("since"))
+		if err != nil {
+			return err
+		}
+
+		timestamp := c.Bool("timestamps")
+		previous := c.Bool("previous")
+		stream := c.String("stream")
+
+		switch stream {
+		case streamStdout, streamStderr, "":
+		default:
+			return fmt.Errorf(`invalid stream %q, must be "stdout" or "stderr"`, stream)
+		}
+
+		if c.IsSet("tail") && c.IsSet("stream") {
+			return errors.New("--tail and --stream are mutually exclusive")
+		}
+
+		logOptions := NewLogOptions(c.Bool("follow"), timestamp, since, &tailLines, &limitBytes)
+
+		status, err := InterruptableRPC(
+			c.Context,
+			func(ctx context.Context) (*pb.ContainerStatusResponse, error) {
+				return runtimeService.ContainerStatus(ctx, containerID, false)
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		logPath := status.GetStatus().GetLogPath()
+		if logPath == "" {
+			return errors.New("the container has not set log path")
+		}
+
+		if previous {
+			containerAttempt := status.GetStatus().GetMetadata().GetAttempt()
+			if containerAttempt == uint32(0) {
+				return fmt.Errorf(
+					"previous terminated container %s not found",
+					status.GetStatus().GetMetadata().GetName(),
+				)
+			}
+
+			dotIdx := strings.LastIndex(logPath, ".")
+
+			ext := ""
+			if dotIdx != -1 {
+				ext = logPath[dotIdx:]
+			}
+
+			logPath = fmt.Sprintf(
+				"%s%s%s",
+				logPath[:strings.LastIndex(logPath, "/")+1],
+				strconv.FormatUint(uint64(containerAttempt-1), 10),
+				ext,
+			)
+		}
+		// build a WithCancel context based on cli.context
+		readLogCtx, cancelFn := context.WithCancel(c.Context)
+
+		go func() {
+			<-SetupInterruptSignalHandler()
+			// cancel readLogCtx when Interrupt signal received
+			cancelFn()
+		}()
+
+		defer func() {
+			// We can not use the typed error "context.Canceled" here
+			// because the upstream K8S dependency explicitly returns a fmt.Errorf("context cancelled").
+			// So we need to compare the error in string.
+			if retErr != nil && retErr.Error() == "context cancelled" {
+				// Silent the "context cancelled" error.
+				// In order to prevent the error msg when user hit Ctrl+C.
+				retErr = nil
+			}
+			// Ensure no context leak
+			cancelFn()
+		}()
+
+		var (
+			stdoutStream io.Writer = os.Stdout
+			stderrStream io.Writer = os.Stderr
+		)
+
+		switch stream {
+		case streamStdout:
+			stderrStream = nil
+		case streamStderr:
+			stdoutStream = nil
+		}
+
+		return logs.ReadLogs(
+			readLogCtx,
+			logPath,
+			status.GetStatus().GetId(),
+			logOptions,
+			runtimeService,
+			stdoutStream,
+			stderrStream,
+		)
 	},
 }
 
 // parseTimestamp parses timestamp string as golang duration,
 // then RFC3339 time and finally as a Unix timestamp.
-func parseTimestamp(value string) (*metav1.Time, error) {
+func parseTimestamp(value string) (time.Time, error) {
 	if value == "" {
-		return nil, nil
+		return time.Time{}, nil
 	}
-	str, err := timetypes.GetTimestamp(value, time.Now())
+
+	str, err := timetype.GetTimestamp(value, time.Now())
 	if err != nil {
-		return nil, err
+		return time.Time{}, err
 	}
-	s, ns, err := timetypes.ParseTimestamps(str, 0)
+
+	s, ns, err := timetype.ParseTimestamps(str, 0)
 	if err != nil {
-		return nil, err
+		return time.Time{}, err
 	}
-	t := metav1.NewTime(time.Unix(s, ns))
-	return &t, nil
+
+	return time.Unix(s, ns), nil
 }

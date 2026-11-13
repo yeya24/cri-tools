@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,104 +17,188 @@ limitations under the License.
 package benchmark
 
 import (
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"fmt"
+	"path"
+	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gmeasure"
+	"github.com/sirupsen/logrus"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/framework"
+)
+
+const (
+	defaultContainerBenchmarkTimeoutSeconds = 60
 )
 
 var _ = framework.KubeDescribe("Container", func() {
 	f := framework.NewDefaultCRIFramework()
 
-	var rc internalapi.RuntimeService
-	var ic internalapi.ImageManagerService
+	var (
+		rc internalapi.RuntimeService
+		ic internalapi.ImageManagerService
+	)
 
-	BeforeEach(func() {
+	BeforeEach(func(ctx SpecContext) {
 		rc = f.CRIClient.CRIRuntimeClient
 		ic = f.CRIClient.CRIImageClient
 	})
 
 	Context("benchmark about operations on Container", func() {
-		var podID string
-		var podConfig *runtimeapi.PodSandboxConfig
-
-		BeforeEach(func() {
-			podID, podConfig = framework.CreatePodSandboxForContainer(rc)
-		})
-
-		AfterEach(func() {
-			By("stop PodSandbox")
-			rc.StopPodSandbox(podID)
-			By("delete PodSandbox")
-			rc.RemovePodSandbox(podID)
-		})
-
-		Measure("benchmark about basic operations on Container", func(b Benchmarker) {
-			var containerID string
-			var err error
-
-			operation := b.Time("create Container", func() {
-				By("benchmark about creating Container")
-				containerID = framework.CreateDefaultContainer(rc, ic, podID, podConfig, "Container-for-creating-benchmark-")
-			})
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "create Container shouldn't take too long.")
-
-			operation = b.Time("start Container", func() {
-				By("benchmark about starting Container")
-				err = rc.StartContainer(containerID)
-			})
-
-			framework.ExpectNoError(err, "failed to start Container: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "start Container shouldn't take too long.")
-
-			operation = b.Time("Container status", func() {
-				By("benchmark about getting Container status")
-				_, err = rc.ContainerStatus(containerID)
-			})
-
-			framework.ExpectNoError(err, "failed to get Container status: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "get container status shouldn't take too long.")
-
-			operation = b.Time("stop Container", func() {
-				By("benchmark about stoping Container")
-				err = rc.StopContainer(containerID, framework.DefaultStopContainerTimeout)
-			})
-
-			framework.ExpectNoError(err, "failed to stop Container: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "stop Container shouldn't take too long.")
-
-			operation = b.Time("remove Container", func() {
-				By("benchmark about removing Container")
-				err = rc.RemoveContainer(containerID)
-			})
-
-			framework.ExpectNoError(err, "failed to remove Container: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "remove Container shouldn't take too long.")
-
-		}, defaultOperationTimes)
-
-		Measure("benchmark about listing Container", func(b Benchmarker) {
-			containerList := make([]string, 0, framework.TestContext.Number)
-			var err error
-
-			for i := 0; i < framework.TestContext.Number; i++ {
-				containerID := framework.CreateDefaultContainer(rc, ic, podID, podConfig, "Container-for-listing-benchmark-")
-				containerList = append(containerList, containerID)
+		It("benchmark about basic operations on Container", func(ctx SpecContext) {
+			timeout := defaultContainerBenchmarkTimeoutSeconds
+			if framework.TestContext.BenchmarkingParams.ContainerBenchmarkTimeoutSeconds > 0 {
+				timeout = framework.TestContext.BenchmarkingParams.ContainerBenchmarkTimeoutSeconds
 			}
 
-			operation := b.Time("list Container", func() {
-				_, err = rc.ListContainers(nil)
-			})
-
-			framework.ExpectNoError(err, "failed to list Container: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 2), "list Container shouldn't take too long.")
-
-			for _, containerID := range containerList {
-				rc.StopContainer(containerID, framework.DefaultStopContainerTimeout)
-				rc.RemoveContainer(containerID)
+			// Setup sampling config from TestContext:
+			samplingConfig := gmeasure.SamplingConfig{
+				N:           framework.TestContext.BenchmarkingParams.ContainersNumber,
+				NumParallel: framework.TestContext.BenchmarkingParams.ContainersNumberParallel,
 			}
-		}, defaultOperationTimes)
+			if samplingConfig.N <= 0 {
+				Skip(
+					"skipping container lifecycle benchmarks since container number option was not set",
+				)
+			}
+
+			if samplingConfig.NumParallel < 1 {
+				samplingConfig.NumParallel = 1
+			}
+
+			// Setup results reporting channel:
+			resultsSet := LifecycleBenchmarksResultsSet{
+				OperationsNames: []string{
+					"CreateContainer",
+					"StartContainer",
+					"StatusContainer",
+					"StopContainer",
+					"RemoveContainer",
+				},
+				NumParallel: samplingConfig.NumParallel,
+				Datapoints:  make([]LifecycleBenchmarkDatapoint, 0),
+			}
+			resultsManager := NewLifecycleBenchmarksResultsManager(
+				resultsSet,
+				timeout,
+			)
+			resultsChannel := resultsManager.StartResultsConsumer()
+
+			experiment := gmeasure.NewExperiment("ContainerOps")
+			experiment.Sample(func(idx int) {
+				var (
+					podID                      string
+					podConfig                  *runtimeapi.PodSandboxConfig
+					containerID                string
+					lastStartTime, lastEndTime int64
+					err                        error
+				)
+
+				durations := make([]int64, len(resultsSet.OperationsNames))
+
+				podID, podConfig = framework.CreatePodSandboxForContainer(ctx, rc)
+
+				By(fmt.Sprintf("CreatingContainer %d", idx))
+
+				startTime := time.Now().UnixNano()
+				lastStartTime = startTime
+				containerID = framework.CreateDefaultContainer(
+					ctx,
+					rc,
+					ic,
+					podID,
+					podConfig,
+					"Benchmark-container-",
+				)
+				lastEndTime = time.Now().UnixNano()
+				durations[0] = lastEndTime - lastStartTime
+
+				By(fmt.Sprintf("StartingContainer %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				err = rc.StartContainer(ctx, containerID)
+				lastEndTime = time.Now().UnixNano()
+				durations[1] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to start Container")
+
+				By(fmt.Sprintf("ContainerStatus %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				_, err = rc.ContainerStatus(ctx, containerID, true)
+				lastEndTime = time.Now().UnixNano()
+				durations[2] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to get Container status")
+
+				By(fmt.Sprintf("ContainerStop %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				err = rc.StopContainer(ctx, containerID, framework.DefaultStopContainerTimeout)
+				lastEndTime = time.Now().UnixNano()
+				durations[3] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to stop Container")
+
+				By(fmt.Sprintf("ContainerRemove %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				err = rc.RemoveContainer(ctx, containerID)
+				lastEndTime = time.Now().UnixNano()
+				durations[4] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to remove Container")
+
+				res := LifecycleBenchmarkDatapoint{
+					SampleIndex:           idx,
+					StartTime:             startTime,
+					EndTime:               lastEndTime,
+					OperationsDurationsNs: durations,
+					MetaInfo: map[string]string{
+						"podId":       podID,
+						"containerId": containerID,
+					},
+				}
+				resultsChannel <- &res
+
+				By(fmt.Sprintf("stop PodSandbox %d", idx))
+				Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
+				By(fmt.Sprintf("delete PodSandbox %d", idx))
+				Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			}, samplingConfig)
+
+			// Send nil and give the manager a minute to process any already-queued results:
+			resultsChannel <- nil
+
+			err := resultsManager.AwaitAllResults(60)
+			if err != nil {
+				logrus.Errorf("Results manager failed to await all results: %v", err)
+			}
+
+			if framework.TestContext.BenchmarkingOutputDir != "" {
+				filepath := path.Join(
+					framework.TestContext.BenchmarkingOutputDir,
+					"container_benchmark_data.json",
+				)
+
+				err = resultsManager.WriteResultsFile(filepath)
+				if err != nil {
+					logrus.Errorf(
+						"Error occurred while writing benchmark results to file %s: %v",
+						filepath,
+						err,
+					)
+				}
+			} else {
+				logrus.Infof(
+					"No benchmarking output dir provided, skipping writing benchmarking results file",
+				)
+				logrus.Infof("Benchmark results were: %+v", resultsManager.resultsSet)
+			}
+		})
 	})
 })

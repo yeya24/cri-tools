@@ -17,12 +17,14 @@ limitations under the License.
 package validate
 
 import (
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"context"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
 const (
@@ -38,47 +40,51 @@ var _ = framework.KubeDescribe("Runtime info", func() {
 		c = f.CRIClient.CRIRuntimeClient
 	})
 	Context("runtime should support returning runtime info", func() {
-		It("runtime should return version info [Conformance]", func() {
-			TestGetVersion(c)
+		It("runtime should return version info [Conformance]", func(ctx SpecContext) {
+			TestGetVersion(ctx, c)
 		})
 
-		It("runtime should return runtime conditions [Conformance]", func() {
+		It("runtime should return runtime conditions [Conformance]", func(ctx SpecContext) {
 			By("test runtime status")
-			TestGetRuntimeStatus(c)
+			TestGetRuntimeStatus(ctx, c)
 		})
 	})
 })
 
 // TestGetVersion test if we can get runtime version info.
-func TestGetVersion(c internalapi.RuntimeService) {
-	version := getVersion(c)
-	Expect(version.Version).To(Not(BeNil()), "Version should not be nil")
-	Expect(version.RuntimeName).To(Not(BeNil()), "RuntimeName should not be nil")
-	Expect(version.RuntimeVersion).To(Not(BeNil()), "RuntimeVersion should not be nil")
-	Expect(version.RuntimeApiVersion).To(Not(BeNil()), "RuntimeApiVersion should not be nil")
+func TestGetVersion(ctx context.Context, c internalapi.RuntimeService) {
+	version := getVersion(ctx, c)
+	Expect(version.GetVersion()).To(Not(BeNil()), "Version should not be nil")
+	Expect(version.GetRuntimeName()).To(Not(BeNil()), "RuntimeName should not be nil")
+	Expect(version.GetRuntimeVersion()).To(Not(BeNil()), "RuntimeVersion should not be nil")
+	Expect(version.GetRuntimeApiVersion()).To(Not(BeNil()), "RuntimeApiVersion should not be nil")
 	framework.Logf("Get version info succeed")
 }
 
 // TestGetRuntimeStatus test if we can get runtime status.
-func TestGetRuntimeStatus(c internalapi.RuntimeService) {
+func TestGetRuntimeStatus(ctx context.Context, c internalapi.RuntimeService) {
 	var count int
-	status, err := c.Status()
-	framework.ExpectNoError(err, "failed to get runtime conditions: %v", err)
 
-	for _, condition := range status.Conditions {
-		if condition.Type == "RuntimeReady" && condition.Status == true {
-			count = count + 1
+	status, err := c.Status(ctx, false)
+	framework.ExpectNoError(err, "failed to get runtime conditions")
+
+	for _, condition := range status.GetStatus().GetConditions() {
+		if condition.GetType() == "RuntimeReady" && condition.GetStatus() {
+			count++
 		}
-		if condition.Type == "NetworkReady" && condition.Status == true {
-			count = count + 1
+
+		if condition.GetType() == "NetworkReady" && condition.GetStatus() {
+			count++
 		}
 	}
-	Expect(count >= 2).To(BeTrue(), "should return all the required runtime conditions")
+
+	Expect(count).To(BeNumerically(">=", 2), "should return all the required runtime conditions")
 }
 
 // getVersion gets runtime version info.
-func getVersion(c internalapi.RuntimeService) *runtimeapi.VersionResponse {
-	version, err := c.Version(defaultAPIVersion)
-	framework.ExpectNoError(err, "failed to get version: %v", err)
+func getVersion(ctx context.Context, c internalapi.RuntimeService) *runtimeapi.VersionResponse {
+	version, err := c.Version(ctx, defaultAPIVersion)
+	framework.ExpectNoError(err, "failed to get version")
+
 	return version
 }

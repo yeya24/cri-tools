@@ -22,40 +22,55 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 
-	"github.com/kubernetes-sigs/cri-tools/pkg/common"
+	"sigs.k8s.io/cri-tools/pkg/common"
 )
 
 var configCommand = &cli.Command{
 	Name:  "config",
-	Usage: "Get and set crictl client configuration options",
+	Usage: "Get, set and list crictl configuration options",
 	ArgsUsage: `[<crictl options>]
 
-EXAMPLE:
+EXAMPLES:
+   # Set the key "debug" to "true"
    crictl config --set debug=true
 
+   # Set the key "debug" to "true"
+   crictl config debug true
+
+   # Get the value of "debug"
+   crictl config --get debug
+
+   # Show the full configuration
+   crictl config --list
+
 CRICTL OPTIONS:
-	 runtime-endpoint:	Container runtime endpoint
-	 image-endpoint:	Image endpoint
-	 timeout:	Timeout of connecting to server (default: 2s)
+	 runtime-endpoint:	Container Runtime Interface (CRI) runtime endpoint (default: "")
+	 image-endpoint:	Container Runtime Interface (CRI) image endpoint (default: "")
+	 timeout:	Timeout of connecting to server (default: 2)
 	 debug:	Enable debug output (default: false)
 	 pull-image-on-create:	Enable pulling image on create requests (default: false)
-	 disable-pull-on-run:	Disable pulling image on run requests (default: false)`,
+	 disable-pull-on-run:	Disable pulling image on run requests (default: false)
+	 max-retries:	Max retries for connecting to an explicitly set endpoint (default: 3, 0 to disable, negative for infinite)`,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:  "get",
-			Usage: "show the option value",
+			Usage: "Show the option value",
 		},
 		&cli.StringSliceFlag{
 			Name:  "set",
-			Usage: "set option (can specify multiple or separate values with commas: opt1=val1,opt2=val2)",
+			Usage: "Set option (can specify multiple or separate values with commas: opt1=val1,opt2=val2)",
+		},
+		&cli.BoolFlag{
+			Name:  "list",
+			Usage: "Show all option value",
 		},
 	},
-	Action: func(context *cli.Context) error {
-		configFile := context.String("config")
+	Action: func(c *cli.Context) error {
+		configFile := c.String("config")
 		if _, err := os.Stat(configFile); err != nil {
 			if err := common.WriteConfig(nil, configFile); err != nil {
 				return err
@@ -64,90 +79,132 @@ CRICTL OPTIONS:
 		// Get config from file.
 		config, err := common.ReadConfig(configFile)
 		if err != nil {
-			return errors.Wrap(err, "load config file")
+			return fmt.Errorf("load config file: %w", err)
 		}
-		if context.IsSet("get") {
-			get := context.String("get")
+
+		if c.IsSet("get") {
+			get := c.String("get")
 			switch get {
-			case "runtime-endpoint":
+			case common.RuntimeEndpoint:
 				fmt.Println(config.RuntimeEndpoint)
-			case "image-endpoint":
+			case common.ImageEndpoint:
 				fmt.Println(config.ImageEndpoint)
-			case "timeout":
+			case common.Timeout:
 				fmt.Println(config.Timeout)
-			case "debug":
+			case common.Debug:
 				fmt.Println(config.Debug)
-			case "pull-image-on-create":
+			case common.PullImageOnCreate:
 				fmt.Println(config.PullImageOnCreate)
-			case "disable-pull-on-run":
+			case common.DisablePullOnRun:
 				fmt.Println(config.DisablePullOnRun)
+			case common.MaxRetries:
+				fmt.Println(config.MaxRetries)
 			default:
-				return errors.Errorf("no configuration option named %s", get)
+				return fmt.Errorf("no configuration option named %s", get)
 			}
+
 			return nil
-		} else if context.IsSet("set") {
-			settings := context.StringSlice("set")
+		} else if c.IsSet("set") {
+			settings := c.StringSlice("set")
 			for _, setting := range settings {
-				options := strings.Split(setting, ",")
-				for _, option := range options {
+				options := strings.SplitSeq(setting, ",")
+				for option := range options {
 					pair := strings.Split(option, "=")
 					if len(pair) != 2 {
-						return errors.Errorf("incorrectly specified option: %v", setting)
+						return fmt.Errorf("incorrectly specified option: %v", setting)
 					}
+
 					key := pair[0]
+
 					value := pair[1]
 					if err := setValue(key, value, config); err != nil {
 						return err
 					}
 				}
 			}
+
 			return common.WriteConfig(config, configFile)
-		} else { // default for backwards compatibility
-			key := context.Args().First()
-			if key == "" {
-				return cli.ShowSubcommandHelp(context)
-			}
-			value := context.Args().Get(1)
-			if err := setValue(key, value, config); err != nil {
-				return err
-			}
-			return common.WriteConfig(config, configFile)
+		} else if c.Bool("list") {
+			display := newDefaultTableDisplay()
+			display.AddRow([]string{columnKey, columnValue})
+			display.AddRow([]string{common.RuntimeEndpoint, config.RuntimeEndpoint})
+			display.AddRow([]string{common.ImageEndpoint, config.ImageEndpoint})
+			display.AddRow([]string{common.Timeout, strconv.Itoa(config.Timeout)})
+			display.AddRow([]string{common.Debug, strconv.FormatBool(config.Debug)})
+			display.AddRow(
+				[]string{common.PullImageOnCreate, strconv.FormatBool(config.PullImageOnCreate)},
+			)
+			display.AddRow(
+				[]string{common.DisablePullOnRun, strconv.FormatBool(config.DisablePullOnRun)},
+			)
+			display.AddRow([]string{common.MaxRetries, strconv.Itoa(config.MaxRetries)})
+			display.ClearScreen()
+			display.Flush()
+
+			return nil
 		}
+
+		// default for backwards compatibility
+		key := c.Args().First()
+		if key == "" {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		value := c.Args().Get(1)
+		logrus.Infof("No --get, --set or --list provided, setting key %q to value %q", key, value)
+
+		if err := setValue(key, value, config); err != nil {
+			return fmt.Errorf("set %q to %q: %w", key, value, err)
+		}
+
+		return common.WriteConfig(config, configFile)
 	},
 }
 
 func setValue(key, value string, config *common.Config) error {
 	switch key {
-	case "runtime-endpoint":
+	case common.RuntimeEndpoint:
 		config.RuntimeEndpoint = value
-	case "image-endpoint":
+	case common.ImageEndpoint:
 		config.ImageEndpoint = value
-	case "timeout":
+	case common.Timeout:
 		n, err := strconv.Atoi(value)
 		if err != nil {
-			return errors.Wrapf(err, "parse timeout value '%s'", value)
+			return fmt.Errorf("parse timeout value '%s': %w", value, err)
 		}
+
 		config.Timeout = n
-	case "debug":
+	case common.Debug:
 		debug, err := strconv.ParseBool(value)
 		if err != nil {
-			return errors.Wrapf(err, "parse debug value '%s'", value)
+			return fmt.Errorf("parse debug value '%s': %w", value, err)
 		}
+
 		config.Debug = debug
-	case "pull-image-on-create":
+	case common.PullImageOnCreate:
 		pi, err := strconv.ParseBool(value)
 		if err != nil {
-			return errors.Wrapf(err, "parse pull-image-on-create value '%s'", value)
+			return fmt.Errorf("parse pull-image-on-create value '%s': %w", value, err)
 		}
+
 		config.PullImageOnCreate = pi
-	case "disable-pull-on-run":
+	case common.DisablePullOnRun:
 		pi, err := strconv.ParseBool(value)
 		if err != nil {
-			return errors.Wrapf(err, "parse disable-pull-on-run value '%s'", value)
+			return fmt.Errorf("parse disable-pull-on-run value '%s': %w", value, err)
 		}
+
 		config.DisablePullOnRun = pi
+	case common.MaxRetries:
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse max-retries value '%s': %w", value, err)
+		}
+
+		config.MaxRetries = n
 	default:
-		return errors.Errorf("no configuration option named %s", key)
+		return fmt.Errorf("no configuration option named %s", key)
 	}
+
 	return nil
 }

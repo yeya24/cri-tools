@@ -17,14 +17,16 @@ limitations under the License.
 package common
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
-// ServerConfiguration is the config for connecting to and using a CRI server
+// ServerConfiguration is the config for connecting to and using a CRI server.
 type ServerConfiguration struct {
 	// RuntimeEndpoint is CRI server runtime endpoint
 	RuntimeEndpoint string
@@ -38,28 +40,39 @@ type ServerConfiguration struct {
 	PullImageOnCreate bool
 	// DisablePullOnRun disables pulling an image for run requests
 	DisablePullOnRun bool
+	// MaxRetries is the number of retries for connecting to the server
+	MaxRetries int
 }
 
-// GetServerConfigFromFile returns the CRI server configuration from file
+// GetServerConfigFromFile returns the CRI server configuration from file.
 func GetServerConfigFromFile(configFileName, currentDir string) (*ServerConfiguration, error) {
 	serverConfig := ServerConfiguration{}
+
 	if _, err := os.Stat(configFileName); err != nil {
-		if !os.IsNotExist(err) {
-			return nil, errors.Wrap(err, "load config file")
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("load config file: %w", err)
 		}
 		// If the config file was not found, try looking in the program's
 		// directory as a fallback. This is to accommodate where the config file
 		// is placed with the cri tools binary.
-		configFileName = filepath.Join(filepath.Dir(currentDir), "crictl.yaml")
-		if _, err := os.Stat(configFileName); err != nil {
-			return nil, errors.Wrap(err, "load config file")
+		nextConfigFileName := filepath.Join(filepath.Dir(currentDir), "crictl.yaml")
+		logrus.Warnf(
+			"Config %q does not exist, trying next: %q",
+			configFileName,
+			nextConfigFileName,
+		)
+
+		if _, err := os.Stat(nextConfigFileName); err != nil {
+			return nil, fmt.Errorf("load config file: %w", err)
 		}
+
+		configFileName = nextConfigFileName
 	}
 
 	// Get config from file.
 	config, err := ReadConfig(configFileName)
 	if err != nil {
-		return nil, errors.Wrap(err, "load config file")
+		return nil, fmt.Errorf("load config file: %w", err)
 	}
 
 	// Set the config from file to the server config struct for return
@@ -69,5 +82,7 @@ func GetServerConfigFromFile(configFileName, currentDir string) (*ServerConfigur
 	serverConfig.Debug = config.Debug
 	serverConfig.PullImageOnCreate = config.PullImageOnCreate
 	serverConfig.DisablePullOnRun = config.DisablePullOnRun
+	serverConfig.MaxRetries = config.MaxRetries
+
 	return &serverConfig, nil
 }

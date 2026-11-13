@@ -17,19 +17,9 @@ limitations under the License.
 package validate
 
 import (
-	"fmt"
-	"math/rand"
-	"os"
-	"path"
 	"testing"
-	"time"
 
-	"github.com/golang/glog"
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	"github.com/onsi/ginkgo/config"
-	"github.com/onsi/ginkgo/reporters"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -39,20 +29,7 @@ import (
 // generated in this directory.
 // This function is called on each Ginkgo node in parallel mode.
 func TestE2ECRI(t *testing.T) {
-	rand.Seed(time.Now().UTC().UnixNano())
+	t.Parallel()
 	RegisterFailHandler(Fail)
-	r := []Reporter{}
-	reportDir := framework.TestContext.ReportDir
-	if reportDir != "" {
-		// Create the directory if it doesn't already exists
-		if err := os.MkdirAll(reportDir, 0755); err != nil {
-			glog.Errorf("Failed creating report directory: %v", err)
-		} else {
-			// Configure a junit reporter to write to the directory
-			junitFile := fmt.Sprintf("junit_%s%02d.xml", framework.TestContext.ReportPrefix, config.GinkgoConfig.ParallelNode)
-			junitPath := path.Join(reportDir, junitFile)
-			r = append(r, reporters.NewJUnitReporter(junitPath))
-		}
-	}
-	RunSpecsWithDefaultAndCustomReporters(t, "E2ECRI Suite", r)
+	RunSpecs(t, "E2ECRI Suite")
 }

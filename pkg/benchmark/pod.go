@@ -1,5 +1,5 @@
 /*
-Copyright 2017 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,22 @@ limitations under the License.
 package benchmark
 
 import (
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
-	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"fmt"
+	"path"
+	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega/gmeasure"
+	"github.com/sirupsen/logrus"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/common"
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
 const (
-	defaultOperationTimes int = 20
+	defaultPodBenchmarkTimeoutSeconds = 60
 )
 
 var _ = framework.KubeDescribe("PodSandbox", func() {
@@ -34,75 +40,146 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 
 	var c internalapi.RuntimeService
 
-	BeforeEach(func() {
+	BeforeEach(func(ctx SpecContext) {
 		c = f.CRIClient.CRIRuntimeClient
 	})
 
 	Context("benchmark about operations on PodSandbox", func() {
-		Measure("benchmark about lifecycle of PodSandbox", func(b Benchmarker) {
-			var podID string
-			var err error
-
-			podSandboxName := "PodSandbox-for-creating-performance-test-" + framework.NewUUID()
-			uid := framework.DefaultUIDPrefix + framework.NewUUID()
-			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-
-			config := &runtimeapi.PodSandboxConfig{
-				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
-				Linux:    &runtimeapi.LinuxPodSandboxConfig{},
-				Labels:   framework.DefaultPodLabels,
+		It("benchmark about lifecycle of PodSandbox", func(ctx SpecContext) {
+			timeout := defaultPodBenchmarkTimeoutSeconds
+			if framework.TestContext.BenchmarkingParams.ContainerBenchmarkTimeoutSeconds > 0 {
+				timeout = framework.TestContext.BenchmarkingParams.ContainerBenchmarkTimeoutSeconds
 			}
 
-			// TODO: add support of runtime
-			operation := b.Time("create PodSandbox", func() {
-				podID, err = c.RunPodSandbox(config, framework.TestContext.RuntimeHandler)
-			})
-
-			framework.ExpectNoError(err, "failed to create PodSandbox: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 5), "create PodSandbox shouldn't take too long.")
-
-			operation = b.Time("PodSandbox status", func() {
-				_, err = c.PodSandboxStatus(podID)
-			})
-
-			framework.ExpectNoError(err, "failed to get PodSandbox status: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 5), "get PodSandbox status shouldn't take too long.")
-
-			operation = b.Time("stop PodSandbox", func() {
-				err = c.StopPodSandbox(podID)
-			})
-
-			framework.ExpectNoError(err, "failed to stop PodSandbox: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 5), "stop PodSandbox shouldn't take too long.")
-
-			operation = b.Time("remove PodSandbox", func() {
-				c.RemovePodSandbox(podID)
-			})
-
-			framework.ExpectNoError(err, "failed to remove PodSandbox: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 5), "remove PodSandbox shouldn't take too long.")
-		}, defaultOperationTimes)
-
-		Measure("benchmark about listing PodSandbox", func(b Benchmarker) {
-			podList := make([]string, 0, framework.TestContext.Number)
-			var err error
-
-			for i := 0; i < framework.TestContext.Number; i++ {
-				podID := framework.RunDefaultPodSandbox(c, "PodSandbox-for-list-benchmark-")
-				podList = append(podList, podID)
+			// Setup sampling config from TestContext:
+			samplingConfig := gmeasure.SamplingConfig{
+				N:           framework.TestContext.BenchmarkingParams.PodsNumber,
+				NumParallel: framework.TestContext.BenchmarkingParams.PodsNumberParallel,
+			}
+			if samplingConfig.N <= 0 {
+				Skip("skipping pod lifecycle benchmarks since pod number option was not set")
 			}
 
-			operation := b.Time("list PodSandbox", func() {
-				_, err = c.ListPodSandbox(nil)
-			})
-
-			framework.ExpectNoError(err, "failed to list PodSandbox: %v", err)
-			Expect(operation.Seconds()).Should(BeNumerically("<", 5), "list PodSandbox shouldn't take too long.")
-
-			for _, podID := range podList {
-				c.StopPodSandbox(podID)
-				c.RemovePodSandbox(podID)
+			if samplingConfig.NumParallel < 1 {
+				samplingConfig.NumParallel = 1
 			}
-		}, defaultOperationTimes)
+
+			// Setup results reporting channel:
+			resultsSet := LifecycleBenchmarksResultsSet{
+				OperationsNames: []string{"CreatePod", "StatusPod", "StopPod", "RemovePod"},
+				NumParallel:     samplingConfig.NumParallel,
+				Datapoints:      make([]LifecycleBenchmarkDatapoint, 0),
+			}
+			resultsManager := NewLifecycleBenchmarksResultsManager(
+				resultsSet,
+				timeout,
+			)
+			resultsChannel := resultsManager.StartResultsConsumer()
+
+			experiment := gmeasure.NewExperiment("PodLifecycle")
+			experiment.Sample(func(idx int) {
+				var (
+					lastStartTime, lastEndTime int64
+					podID                      string
+					err                        error
+				)
+
+				durations := make([]int64, len(resultsSet.OperationsNames))
+
+				podSandboxName := "PodSandbox-for-creating-performance-test-" + framework.NewUUID()
+				uid := framework.DefaultUIDPrefix + framework.NewUUID()
+				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+				config := &runtimeapi.PodSandboxConfig{
+					Metadata: framework.BuildPodSandboxMetadata(
+						podSandboxName,
+						uid,
+						namespace,
+						framework.DefaultAttempt,
+					),
+					Linux: &runtimeapi.LinuxPodSandboxConfig{
+						CgroupParent: common.GetCgroupParent(ctx, c),
+					},
+					Labels: framework.DefaultPodLabels,
+				}
+
+				By(fmt.Sprintf("Creating a pod %d", idx))
+
+				startTime := time.Now().UnixNano()
+				lastStartTime = startTime
+				podID, err = c.RunPodSandbox(ctx, config, framework.TestContext.RuntimeHandler)
+				lastEndTime = time.Now().UnixNano()
+				durations[0] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to create PodSandbox")
+
+				By(fmt.Sprintf("Get Pod status %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				_, err = c.PodSandboxStatus(ctx, podID, true)
+				lastEndTime = time.Now().UnixNano()
+				durations[1] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to get PodStatus")
+
+				By(fmt.Sprintf("Stop PodSandbox %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				err = c.StopPodSandbox(ctx, podID)
+				lastEndTime = time.Now().UnixNano()
+				durations[2] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to stop PodSandbox")
+
+				By(fmt.Sprintf("Remove PodSandbox %d", idx))
+
+				lastStartTime = time.Now().UnixNano()
+				err = c.RemovePodSandbox(ctx, podID)
+				lastEndTime = time.Now().UnixNano()
+				durations[3] = lastEndTime - lastStartTime
+
+				framework.ExpectNoError(err, "failed to remove PodSandbox")
+
+				res := LifecycleBenchmarkDatapoint{
+					SampleIndex:           idx,
+					StartTime:             startTime,
+					EndTime:               lastEndTime,
+					OperationsDurationsNs: durations,
+					MetaInfo: map[string]string{
+						"podId":          podID,
+						"podSandboxName": podSandboxName,
+					},
+				}
+				resultsChannel <- &res
+			}, samplingConfig)
+
+			// Send nil and give the manager a minute to process any already-queued results:
+			resultsChannel <- nil
+
+			err := resultsManager.AwaitAllResults(60)
+			if err != nil {
+				logrus.Errorf("Results manager failed to await all results: %v", err)
+			}
+
+			if framework.TestContext.BenchmarkingOutputDir != "" {
+				filepath := path.Join(
+					framework.TestContext.BenchmarkingOutputDir,
+					"pod_benchmark_data.json",
+				)
+
+				err = resultsManager.WriteResultsFile(filepath)
+				if err != nil {
+					logrus.Errorf(
+						"Error occurred while writing benchmark results to file %s: %v",
+						filepath,
+						err,
+					)
+				}
+			} else {
+				logrus.Info(
+					"No benchmarking out dir provided, skipping writing benchmarking results.",
+				)
+				logrus.Infof("Benchmark results were: %+v", resultsManager.resultsSet)
+			}
+		})
 	})
 })

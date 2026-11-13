@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM busybox
+FROM busybox:1.38.0
 ARG USER
 USER ${USER}

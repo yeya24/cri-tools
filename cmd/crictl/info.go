@@ -17,11 +17,14 @@ limitations under the License.
 package main
 
 import (
-	"github.com/pkg/errors"
+	"context"
+	"encoding/json"
+	"fmt"
+
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 var runtimeStatusCommand = &cli.Command{
@@ -33,7 +36,7 @@ var runtimeStatusCommand = &cli.Command{
 		&cli.StringFlag{
 			Name:    "output",
 			Aliases: []string{"o"},
-			Value:   "json",
+			Value:   outputTypeJSON,
 			Usage:   "Output format, One of: json|yaml|go-template",
 		},
 		&cli.BoolFlag{
@@ -46,34 +49,64 @@ var runtimeStatusCommand = &cli.Command{
 			Usage: "The template string is only used when output is go-template; The Template format is golang template",
 		},
 	},
-	Action: func(context *cli.Context) error {
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+	Action: func(c *cli.Context) error {
+		if c.NArg() != 0 {
+			return cli.ShowSubcommandHelp(c)
+		}
+
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
-		err = Info(context, runtimeClient)
-		if err != nil {
-			return errors.Wrap(err, "getting status of runtime")
+		if err = Info(c, runtimeClient); err != nil {
+			return fmt.Errorf("getting status of runtime: %w", err)
 		}
+
 		return nil
 	},
 }
 
 // Info sends a StatusRequest to the server, and parses the returned StatusResponse.
-func Info(cliContext *cli.Context, client pb.RuntimeServiceClient) error {
+func Info(cliContext *cli.Context, client internalapi.RuntimeService) error {
 	request := &pb.StatusRequest{Verbose: !cliContext.Bool("quiet")}
 	logrus.Debugf("StatusRequest: %v", request)
-	r, err := client.Status(context.Background(), request)
+
+	r, err := InterruptableRPC(
+		cliContext.Context,
+		func(ctx context.Context) (*pb.StatusResponse, error) {
+			return client.Status(ctx, request.GetVerbose())
+		},
+	)
 	logrus.Debugf("StatusResponse: %v", r)
+
 	if err != nil {
 		return err
 	}
 
-	status, err := protobufObjectToJSON(r.Status)
+	statusJSON, err := protobufObjectToJSON(r.GetStatus())
+	if err != nil {
+		return fmt.Errorf("create status JSON: %w", err)
+	}
+
+	handlers, err := json.Marshal(r.GetRuntimeHandlers()) // protobufObjectToJSON cannot be used
 	if err != nil {
 		return err
 	}
-	return outputStatusInfo(status, r.Info, cliContext.String("output"), cliContext.String("template"))
+
+	features, err := json.Marshal(r.GetFeatures()) // protobufObjectToJSON cannot be used
+	if err != nil {
+		return err
+	}
+
+	data := []statusData{
+		{
+			json:            statusJSON,
+			runtimeHandlers: string(handlers),
+			features:        string(features),
+			info:            r.GetInfo(),
+		},
+	}
+
+	return outputStatusData(data, cliContext.String("output"), cliContext.String("template"))
 }

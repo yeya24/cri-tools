@@ -17,13 +17,14 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/urfave/cli/v2"
 )
 
-var bashCompletionTemplate = `_cli_bash_autocomplete() {
+var bashCompletionTemplate = `_crictl() {
     local cur opts base
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
@@ -32,17 +33,17 @@ var bashCompletionTemplate = `_cli_bash_autocomplete() {
     return 0
 }
 
-complete -F _cli_bash_autocomplete crictl`
+complete -F _crictl crictl`
 
 func bashCompletion(c *cli.Context) error {
 	subcommands := []string{}
+
 	for _, command := range c.App.Commands {
 		if command.Hidden {
 			continue
 		}
-		for _, name := range command.Names() {
-			subcommands = append(subcommands, name)
-		}
+
+		subcommands = append(subcommands, command.Names()...)
 	}
 
 	for _, flag := range c.App.Flags {
@@ -51,11 +52,13 @@ func bashCompletion(c *cli.Context) error {
 	}
 
 	fmt.Fprintln(c.App.Writer, fmt.Sprintf(bashCompletionTemplate, strings.Join(subcommands, "\n")))
+
 	return nil
 }
 
-var zshCompletionTemplate = `_cli_zsh_autocomplete() {
+var zshCompletionTemplate = `#compdef crictl
 
+_crictl() {
   local -a cmds
   cmds=('%s')
   _describe 'commands' cmds
@@ -67,28 +70,48 @@ var zshCompletionTemplate = `_cli_zsh_autocomplete() {
   return
 }
 
-compdef _cli_zsh_autocomplete crictl`
+compdef _crictl crictl`
 
 func zshCompletion(c *cli.Context) error {
 	subcommands := []string{}
+
 	for _, command := range c.App.Commands {
 		if command.Hidden {
 			continue
 		}
+
 		for _, name := range command.Names() {
 			subcommands = append(subcommands, name+":"+command.Usage)
 		}
 	}
 
-	opts := []string{}
+	opts := make([]string, 0, len(c.App.Flags))
 	for _, flag := range c.App.Flags {
 		// only includes full flag name.
 		opts = append(opts, "--"+flag.Names()[0])
 	}
 
-	fmt.Fprintln(c.App.Writer, fmt.Sprintf(zshCompletionTemplate, strings.Join(subcommands, "' '"), strings.Join(opts, "' '")))
-	return nil
+	fmt.Fprintln(
+		c.App.Writer,
+		fmt.Sprintf(
+			zshCompletionTemplate,
+			strings.Join(subcommands, "' '"),
+			strings.Join(opts, "' '"),
+		),
+	)
 
+	return nil
+}
+
+func fishCompletion(c *cli.Context) error {
+	completion, err := c.App.ToFishCompletion()
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintln(c.App.Writer, completion)
+
+	return nil
 }
 
 var completionCommand = &cli.Command{
@@ -126,16 +149,7 @@ Examples:
 		case "zsh":
 			return zshCompletion(c)
 		default:
-			return fmt.Errorf("only bash, zsh or fish are supported")
+			return errors.New("only bash, zsh or fish are supported")
 		}
 	},
-}
-
-func fishCompletion(c *cli.Context) error {
-	completion, err := c.App.ToFishCompletion()
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(c.App.Writer, completion)
-	return nil
 }

@@ -17,18 +17,20 @@ limitations under the License.
 package validate
 
 import (
-	"github.com/kubernetes-sigs/cri-tools/pkg/framework"
+	. "github.com/onsi/ginkgo/v2"
 	internalapi "k8s.io/cri-api/pkg/apis"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
-	. "github.com/onsi/ginkgo"
+	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
 var _ = framework.KubeDescribe("Streaming", func() {
 	f := framework.NewDefaultCRIFramework()
 
-	var rc internalapi.RuntimeService
-	var ic internalapi.ImageManagerService
+	var (
+		rc internalapi.RuntimeService
+		ic internalapi.ImageManagerService
+	)
 
 	BeforeEach(func() {
 		rc = f.CRIClient.CRIRuntimeClient
@@ -38,34 +40,49 @@ var _ = framework.KubeDescribe("Streaming", func() {
 	Context("runtime should support streaming interfaces", func() {
 		var podID string
 
-		AfterEach(func() {
-			By("stop PodSandbox")
-			rc.StopPodSandbox(podID)
-			By("delete PodSandbox")
-			rc.RemovePodSandbox(podID)
+		AfterEach(func(ctx SpecContext) {
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
-		It("runtime should support portforward in host network", func() {
-			By("create a PodSandbox with container port port mapping in host network")
+		It("runtime should support portforward in host network", func(ctx SpecContext) {
+			By("create a PodSandbox with container port mapping in host network")
+
 			var podConfig *runtimeapi.PodSandboxConfig
+
 			portMappings := []*runtimeapi.PortMapping{
 				{
 					ContainerPort: webServerHostNetContainerPort,
 				},
 			}
-			podID, podConfig = createPodSandboxWithPortMapping(rc, portMappings, true)
+			podID, podConfig = createPodSandboxWithPortMapping(ctx, rc, portMappings, true)
 
 			By("create a web server container")
-			containerID := createHostNetWebServerContainer(rc, ic, podID, podConfig, "container-for-host-net-portforward-test")
+
+			containerID := createHostNetWebServerContainer(
+				ctx,
+				rc,
+				ic,
+				podID,
+				podConfig,
+				"container-for-host-net-portforward-test",
+			)
 
 			By("start the web server container")
-			startContainer(rc, containerID)
+			startContainer(ctx, rc, containerID)
 
-			req := createDefaultPortForward(rc, podID)
+			By("ensure the web server container is serving")
+			checkMainPage(ctx, rc, "", webServerHostNetContainerPort, 0)
+
+			req := createDefaultPortForward(ctx, rc, podID)
 
 			By("check the output of portforward")
-			checkPortForward(rc, req, webServerHostPortForHostNetPortFroward, webServerHostNetContainerPort)
+			checkPortForward(
+				ctx,
+				rc,
+				req,
+				webServerHostPortForHostNetPortForward,
+				webServerHostNetContainerPort,
+			)
 		})
-
 	})
 })

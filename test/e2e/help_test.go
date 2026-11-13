@@ -17,12 +17,11 @@ limitations under the License.
 package e2e
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 )
 
-// The actual test suite
+// The actual test suite.
 var _ = t.Describe("help", func() {
-
 	const helpMessageIdentifier = "crictl - client for CRI"
 
 	It("should succeed with `help` subcommand", func() {
@@ -40,5 +39,32 @@ var _ = t.Describe("help", func() {
 	It("should show help on invalid flag", func() {
 		t.CrictlExpectFailure("--invalid", helpMessageIdentifier,
 			"flag provided but not defined")
+	})
+})
+
+// The actual test suite.
+var _ = t.Describe("help subcommand", func() {
+	It("should show help running rm without params", func() {
+		t.CrictlExpectSuccess("rm", "crictl rm")
+	})
+
+	It("should show help running rmi without params", func() {
+		t.CrictlExpectSuccess("rmi", "crictl rmi")
+	})
+
+	It("should show help running rmp without params", func() {
+		t.CrictlExpectSuccess("rmp", "crictl rmp")
+	})
+
+	It("should not show help running rm -a", func() {
+		t.CrictlExpect("rm -a", 0, "", "No containers to remove")
+	})
+
+	It("should not show help running rmi -a", func() {
+		t.CrictlExpect("rmi -a", 0, "", "No images to remove")
+	})
+
+	It("should not show help running rmp -a", func() {
+		t.CrictlExpect("rmp -a", 0, "", "No pods to remove")
 	})
 })

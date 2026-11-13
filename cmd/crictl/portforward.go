@@ -17,106 +17,142 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/net/context"
-	restclient "k8s.io/client-go/rest"
-	portforward "k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/transport/spdy"
-	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/client-go/tools/portforward"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"sigs.k8s.io/cri-tools/pkg/common"
 )
 
 var runtimePortForwardCommand = &cli.Command{
 	Name:      "port-forward",
 	Usage:     "Forward local port to a pod",
 	ArgsUsage: "POD-ID [LOCAL_PORT:]REMOTE_PORT",
-	Action: func(context *cli.Context) error {
-		args := context.Args().Slice()
-		if len(args) < 2 {
-			return cli.ShowSubcommandHelp(context)
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:    transportFlag,
+			Aliases: []string{"r"},
+			Value:   common.TransportSpdy,
+			Usage: fmt.Sprintf(
+				"Transport protocol to use, one of: %s|%s",
+				common.TransportSpdy,
+				common.TransportWebsocket,
+			),
+		},
+		&cli.StringFlag{
+			Name:    flagTLSSNI,
+			Usage:   "Server name used in the TLS client to check server certificates against",
+			Aliases: []string{"tls-server-name"},
+			Value:   "localhost",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSCA,
+			Usage: "Path to the streaming TLS CA certificate",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSCert,
+			Usage: "Path to the streaming TLS certificate",
+		},
+		&cli.StringFlag{
+			Name:  flagTLSKey,
+			Usage: "Path to the streaming TLS key",
+		},
+	},
+	Action: func(c *cli.Context) error {
+		if c.NArg() < 2 {
+			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
-		defer closeConnection(context, runtimeConn)
 
-		var opts = portforwardOptions{
-			id:    args[0],
-			ports: args[1:],
+		opts := portforwardOptions{
+			id:        c.Args().Get(0),
+			ports:     c.Args().Tail(),
+			transport: c.String(transportFlag),
 		}
-		err = PortForward(runtimeClient, opts)
+
+		opts.tlsConfig, err = tlsConfigFromFlags(c)
 		if err != nil {
-			return errors.Wrap(err, "port forward")
-
+			return fmt.Errorf("get TLS config from flags: %w", err)
 		}
-		return nil
 
+		if err = PortForward(c.Context, runtimeClient, opts); err != nil {
+			return fmt.Errorf("port forward: %w", err)
+		}
+
+		return nil
 	},
 }
 
-// PortForward sends an PortForwardRequest to server, and parses the returned PortForwardResponse
-func PortForward(client pb.RuntimeServiceClient, opts portforwardOptions) error {
+// PortForward sends an PortForwardRequest to server, and parses the returned PortForwardResponse.
+func PortForward(
+	ctx context.Context,
+	client internalapi.RuntimeService,
+	opts portforwardOptions,
+) error {
 	if opts.id == "" {
-		return fmt.Errorf("ID cannot be empty")
-
+		return errIDEmpty
 	}
+
 	request := &pb.PortForwardRequest{
 		PodSandboxId: opts.id,
 	}
 	logrus.Debugf("PortForwardRequest: %v", request)
-	r, err := client.PortForward(context.Background(), request)
+
+	r, err := InterruptableRPC(ctx, func(ctx context.Context) (*pb.PortForwardResponse, error) {
+		return client.PortForward(ctx, request)
+	})
 	logrus.Debugf("PortForwardResponse; %v", r)
-	if err != nil {
-		return err
-	}
-	portforwardURL := r.Url
 
-	URL, err := url.Parse(portforwardURL)
 	if err != nil {
 		return err
 	}
 
-	if URL.Host == "" {
-		URL.Host = kubeletURLHost
-	}
-
-	if URL.Scheme == "" {
-		URL.Scheme = kubeletURLSchema
-	}
-
-	logrus.Debugf("PortForward URL: %v", URL)
-	transport, upgrader, err := spdy.RoundTripperFor(&restclient.Config{})
+	parsedURL, err := url.Parse(r.GetUrl())
 	if err != nil {
 		return err
 	}
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", URL)
 
-	stopChan := make(chan struct{}, 1)
+	if parsedURL.Host == "" {
+		parsedURL.Host = kubeletURLHost
+	}
+
+	if parsedURL.Scheme == "" {
+		parsedURL.Scheme = kubeletURLSchema
+	}
+
+	logrus.Debugf("PortForward URL: %v", parsedURL)
+
+	dialer, err := common.GetDialer(opts.transport, parsedURL, opts.tlsConfig)
+	if err != nil {
+		return fmt.Errorf("get dialer: %w", err)
+	}
+
 	readyChan := make(chan struct{})
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
-	defer signal.Stop(signals)
+	logrus.Debugf("Ports to forward: %v", opts.ports)
 
-	go func() {
-		<-signals
-		if stopChan != nil {
-			close(stopChan)
-		}
-	}()
-	logrus.Debugf("Ports to forword: %v", opts.ports)
-	pf, err := portforward.New(dialer, opts.ports, stopChan, readyChan, os.Stdout, os.Stderr)
+	pf, err := portforward.NewForStreaming(
+		dialer,
+		opts.ports,
+		SetupInterruptSignalHandler(),
+		readyChan,
+		os.Stdout,
+		os.Stderr,
+	)
 	if err != nil {
 		return err
 	}
+
 	return pf.ForwardPorts()
 }

@@ -17,30 +17,20 @@ limitations under the License.
 package e2e
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega/gexec"
+	. "github.com/onsi/ginkgo/v2"
 )
 
-// The actual test suite
+// The actual test suite.
 var _ = t.Describe("info", func() {
-
-	var (
-		endpoint, testDir string
-		crio              *Session
-	)
-	BeforeEach(func() {
-		endpoint, testDir, crio = t.StartCrio()
-	})
-
-	AfterEach(func() {
-		t.StopCrio(testDir, crio)
-	})
-
 	It("should succeed", func() {
-		t.CrictlExpectSuccessWithEndpoint(endpoint, "info", "NetworkReady")
+		t.CrictlExpectSuccess("info", "NetworkReady")
 	})
 
 	It("should fail with additional argument", func() {
-		t.CrictlExpectFailure("--invalid", "", "flag provided but not defined")
+		t.CrictlExpectFailure(
+			"--invalid",
+			"crictl - client for CRI",
+			"flag provided but not defined",
+		)
 	})
 })

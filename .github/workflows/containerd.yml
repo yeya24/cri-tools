@@ -1,5 +1,16 @@
 name: critest containerd
-on: [push, pull_request]
+on:
+  push:
+    tags:
+      - "*"
+    branches:
+      - master
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
   #
@@ -7,77 +18,76 @@ jobs:
   #
   build-and-critest-containerd:
     strategy:
+      fail-fast: false
       matrix:
         # ╔══════════════════╤═══════════╤═════════╗
         # ║ master / release │ ubuntu    │ windows ║
         # ╠══════════════════╪═══════════╪═════════╣
-        # ║ v1 shim          │ runc      │         ║
-        # ╟──────────────────┼───────────┼─────────╢
         # ║ v2 shim          │ runc/crun │         ║
         # ╟──────────────────┼───────────┼─────────╢
         # ║ hcshim           │           │ runhcs  ║
         # ╚══════════════════╧═══════════╧═════════╝
-        os: [ubuntu-18.04, windows-2019]
-        version: [master, v1.4.3]
-        runtime: [io.containerd.runtime.v1.linux, io.containerd.runc.v1, io.containerd.runc.v2, containerd-shim-runhcs-v1]
+        os: [ubuntu-24.04, windows-2025]
+        # not every command likes the slash in branch name.
+        # So will use format command to replace to either `_` or '/'
+        version: [main, "release{0}2.4", "release{0}2.3"]
         runc: [runc, crun]
+        include:
+          # containerd 2.x only ships the runc v2 shim.
+          - os: ubuntu-24.04
+            runtime: io.containerd.runc.v2
+          - os: windows-2025
+            runtime: containerd-shim-runhcs-v1
         exclude:
-          - runtime: io.containerd.runc.v1
-            os: windows-2019
-          - runtime: io.containerd.runc.v2
-            os: windows-2019
-          - runtime: io.containerd.runtime.v1.linux
-            os: windows-2019
-          - runtime: containerd-shim-runhcs-v1
-            os: ubuntu-18.04
-          - runtime: io.containerd.runc.v1
-            runc: crun
-          - runtime: io.containerd.runtime.v1.linux
-            runc: crun
           - runc: crun
-            os: windows-2019
-    name: ${{matrix.version}} / ${{ matrix.os }} / ${{matrix.runtime}} / ${{matrix.runc}}
+            os: windows-2025
+    name: ${{ format(matrix.version, '/') }} / ${{ matrix.os }} / ${{matrix.runtime}} / ${{matrix.runc}}
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v2
+      - name: Checkout cri-tools for this commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: '1.15'
+          path: ${{github.workspace}}/src/github.com/kubernetes-sigs/cri-tools
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{github.workspace}}/src/github.com/kubernetes-sigs/cri-tools/go.mod
+          cache: false
 
       - name: Set env
+        if: startsWith(matrix.os, 'windows')
         shell: bash
         run: |
           echo "GOPATH=${{ github.workspace }}" >> $GITHUB_ENV
           echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
 
-      - name: Cache go modules and build cache
-        uses: actions/cache@v2
+      - name: Checkout containerd/containerd ${{ format(matrix.version, '/') }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ${{ github.workspace }}/src/github.com/containerd/containerd
+          repository: containerd/containerd
+          ref: ${{ format(matrix.version, '/') }}
+          persist-credentials: false
+
+      - name: Checkout Microsoft/hcsshim
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: startsWith(matrix.os, 'windows')
+        with:
+          repository: Microsoft/hcsshim
+          path: src/github.com/Microsoft/hcsshim
+          persist-credentials: false
+
+      # Paired with "Save go modules and build cache" at end of job.
+      - name: Restore go modules and build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
             '%LocalAppData%\go-build' # Windows
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
-
-      - name: Checkout containerd/containerd ${{matrix.version}}
-        uses: actions/checkout@v2
-        with:
-          path: ${{ github.workspace }}/src/github.com/containerd/containerd
-          repository: containerd/containerd
-          ref: ${{matrix.version}}
-
-      - name: Checkout Microsoft/hcsshim
-        uses: actions/checkout@v2
-        if: startsWith(matrix.os, 'windows')
-        with:
-          repository: Microsoft/hcsshim
-          path: src/github.com/Microsoft/hcsshim
-
-      - name: Checkout cri-tools for this commit
-        uses: actions/checkout@v2
-        with:
-          path: ${{github.workspace}}/src/github.com/kubernetes-sigs/cri-tools
 
       - name: disable ipv6
         if: startsWith(matrix.os, 'ubuntu')
@@ -89,7 +99,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            btrfs-tools \
+            btrfs-progs \
+            libbtrfs-dev \
             libseccomp2 \
             libseccomp-dev \
             socat
@@ -102,69 +113,19 @@ jobs:
         working-directory: ${{ github.workspace }}/src/github.com/containerd/containerd
 
       - name: Install containerd on Windows
+        shell: bash
         if: startsWith(matrix.os, 'windows')
         run: |
-          make
-          make install
+          mingw32-make.exe
+          mingw32-make.exe install
         working-directory: ${{ github.workspace }}/src/github.com/containerd/containerd
 
-      - name: Install ${{matrix.runc}} runtime engine on Linux
+      - name: Install cni on Linux
         if: startsWith(matrix.os, 'ubuntu')
-        env:
-          RUNC_FLAVOR: ${{matrix.runc}}
+        shell: bash
         run: |
-          sudo -E PATH=$PATH script/setup/install-runc
+          sudo -E PATH=$PATH script/setup/install-cni $(grep 'github.com/containernetworking/plugins' go.mod | awk '{print $2}')
         working-directory: src/github.com/containerd/containerd
-
-      - name: Build Windows container shims
-        if: startsWith(matrix.os, 'windows')
-        shell: bash
-        run: |
-          set -o xtrace
-          export CGO_ENABLED=1
-          cd src/github.com/containerd/containerd
-          mingw32-make.exe binaries
-          bindir="$(pwd)"/bin
-          if [ -f "vendor.conf" ]; then
-              SHIM_COMMIT=$(grep 'Microsoft/hcsshim' vendor.conf | awk '{print $2}')
-          else
-              SHIM_COMMIT=$(grep 'Microsoft/hcsshim ' go.mod | awk '{print $2}')
-          fi
-          cd ../../Microsoft/hcsshim
-          git fetch --tags origin "${SHIM_COMMIT}"
-          git checkout "${SHIM_COMMIT}"
-          GO111MODULE=on go build -mod=vendor -o "${bindir}/containerd-shim-runhcs-v1.exe" ./cmd/containerd-shim-runhcs-v1
-          cp "${bindir}"/*.exe /usr/local/bin
-
-      - name: Build cri-tools on Linux
-        if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          make
-          sudo -E PATH=$PATH make install
-        working-directory: ${{ github.workspace }}/src/github.com/kubernetes-sigs/cri-tools
-
-      - name: Build cri-tools on Windows
-        if: startsWith(matrix.os, 'windows')
-        run: |
-          make
-          make install
-        working-directory: ${{ github.workspace }}/src/github.com/kubernetes-sigs/cri-tools
-
-      - name: Install ginkgo on Linux
-        if: startsWith(matrix.os, 'ubuntu')
-        shell: bash
-        run: |
-          go get -u github.com/onsi/ginkgo/ginkgo
-          ginkgo version
-          sudo cp $(command -v ginkgo) /usr/local/bin
-
-      - name: Install ginkgo on Windows
-        if: startsWith(matrix.os, 'windows')
-        shell: bash
-        run: |
-          go get -u github.com/onsi/ginkgo/ginkgo
-          ginkgo version
-          cp $(command -v ginkgo) /usr/local/bin
 
       - name: Install cni on Windows
         if: startsWith(matrix.os, 'windows')
@@ -271,6 +232,45 @@ jobs:
           }
           EOF'
 
+      - name: Install ${{matrix.runc}} runtime engine on Linux
+        if: startsWith(matrix.os, 'ubuntu')
+        env:
+          RUNC_FLAVOR: ${{matrix.runc}}
+        run: |
+          sudo -E PATH=$PATH script/setup/install-runc
+        working-directory: src/github.com/containerd/containerd
+
+      - name: Build cri-tools on Linux
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          make
+          sudo -E PATH=$PATH make install
+        working-directory: ${{ github.workspace }}/src/github.com/kubernetes-sigs/cri-tools
+
+      - name: Build cri-tools on Windows
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          make
+          make install
+        working-directory: ${{ github.workspace }}/src/github.com/kubernetes-sigs/cri-tools
+
+      - name: Install ginkgo on Linux
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          sudo chown -R $(id -u):$(id -g) $(go env GOPATH)
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          ginkgo version
+          sudo cp $(command -v ginkgo) /usr/local/bin
+
+      - name: Install ginkgo on Windows
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          go install github.com/onsi/ginkgo/v2/ginkgo@latest
+          ginkgo version
+          cp $(command -v ginkgo) /usr/local/bin
+
       - name: Run critest on Linux
         if: startsWith(matrix.os, 'ubuntu')
         shell: bash
@@ -278,21 +278,47 @@ jobs:
           set -o errexit
           set -o nounset
           set -o pipefail
+          set -x
 
-          BDIR="$(mktemp -d -p $PWD)"
+          BDIR="/var/lib/containerd-critest"
           echo "containerd temp dir: ${BDIR}"
-          mkdir -p ${BDIR}/{root,state}
+          sudo mkdir -p ${BDIR}/{root,state}
 
-          cat > ${BDIR}/config.toml <<EOF
+          sudo bash -c 'cat > ${BDIR}/config.toml <<EOF
+          version = 2
+          [plugins]
             [plugins.cri.containerd.default_runtime]
               runtime_type = \"${{matrix.runtime}}\"
-          EOF
-          sudo PATH=$PATH /usr/local/bin/containerd -a ${BDIR}/c.sock -root ${BDIR}/root -state ${BDIR}/state -log-level debug &> ${BDIR}/containerd-cri.log &
+          EOF'
+
+          # Enable NRI explicitly to ensure the expected socket path is used.
+          sudo bash -c 'cat >> ${BDIR}/config.toml <<EOF
+          [plugins."io.containerd.nri.v1.nri"]
+            disable = false
+            disable_connections = false
+            plugin_path = "/opt/nri/plugins"
+            socket_path = "/var/run/nri/nri.sock"
+          EOF'
+          sudo mkdir -p /var/run/nri
+          sudo mkdir -p /opt/nri/plugins
+
+          # Remove possibly existing containerd configuration
+          sudo rm -rf /etc/containerd
+          sudo PATH=$PATH bash -c "/usr/local/bin/containerd -a ${BDIR}/c.sock -root ${BDIR}/root -state ${BDIR}/state -log-level debug &> ${BDIR}/containerd-cri.log &"
+
+          while ! grep -q 'containerd successfully booted' ${BDIR}/containerd-cri.log; do
+              sleep 1
+          done
+
           sudo /usr/local/bin/ctr -a ${BDIR}/c.sock version
           sudo /usr/local/sbin/runc --version
+          sudo mount
 
-          sudo -E PATH=$PATH critest --runtime-endpoint=unix:///${BDIR}/c.sock --parallel=8
-          TEST_RC=$?
+          # Build critest flags
+          CRITEST_FLAGS="--ginkgo.v --runtime-endpoint=unix:///${BDIR}/c.sock --parallel=8 --nri-socket=/var/run/nri/nri.sock"
+
+          TEST_RC=0
+          sudo -E PATH=$PATH critest ${CRITEST_FLAGS} || TEST_RC=$?
           test $TEST_RC -ne 0 && cat ${BDIR}/containerd-cri.log
           sudo pkill containerd
           echo "CONTD_CRI_DIR=$BDIR" >> $GITHUB_ENV
@@ -308,39 +334,58 @@ jobs:
 
           export PATH="/usr/local/bin:$PATH"
           FOCUS="${FOCUS:-"Conformance"}"
-          SKIP="${SKIP:-""}"
           REPORT_DIR="${REPORT_DIR:-"c/_artifacts"}"
           mkdir -p "${REPORT_DIR}"
 
           containerd -log-level debug &> "${REPORT_DIR}/containerd-cri.log" &
           pid=$!
+
+          while ! grep -q 'containerd successfully booted' ${REPORT_DIR}/containerd-cri.log; do
+              sleep 1
+          done
           ctr version
 
           set +o errexit
-          critest --runtime-endpoint=npipe:////./pipe/containerd-containerd --ginkgo.focus="${FOCUS}" --ginkgo.skip="${SKIP}" --report-dir="${REPORT_DIR}" --report-prefix="windows"
+          SKIP="exec with tty=true and stdin=true"
+          # The scale fixture exceeds Windows runner disk or time limits.
+          critest --runtime-endpoint=npipe:////./pipe/containerd-containerd --ginkgo.focus="${FOCUS}" --ginkgo.skip="${SKIP}" --ginkgo.label-filter="!Slow" --report-dir="${REPORT_DIR}" --report-prefix="windows"
           TEST_RC=$?
-          test $TEST_RC -ne 0 && cat ${REPORT_DIR}/containerd.log
+          test $TEST_RC -ne 0 && cat ${REPORT_DIR}/containerd-cri.log
           set -o errexit
           kill -9 $pid
           echo "CONTD_CRI_DIR=$REPORT_DIR" >> $GITHUB_ENV
           exit ${TEST_RC}
 
-      - name: Upload containerd ${{matrix.version}} logs
-        uses: actions/upload-artifact@v1
+      - name: Upload containerd ${{ format(matrix.version, '/') }} logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: containerd-${{matrix.version}}-${{ matrix.os }}-${{matrix.runtime}}-${{matrix.runc}}-${{github.sha}}.log
+          name: containerd-${{ format(matrix.version, '_') }}-${{ matrix.os }}-${{matrix.runtime}}-${{matrix.runc}}-${{github.sha}}.log
           path: ${{env.CONTD_CRI_DIR}}/containerd-cri.log
 
       - name: Cleanup temp directory on Linux
         if: startsWith(matrix.os, 'ubuntu')
         shell: bash
         run: |
-          echo "Cleanup temp directory ${{env.CONTD_CRI_DIR}} created for cri tests"
-          sudo rm -rf ${{env.CONTD_CRI_DIR}}
+          echo "Cleanup temp directory $CONTD_CRI_DIR created for cri tests"
+          sudo umount -Rl "$CONTD_CRI_DIR" 2>/dev/null || true
+          sudo rm -rf "$CONTD_CRI_DIR"
 
       - name: Cleanup temp directory on Windows
         if: startsWith(matrix.os, 'windows')
         shell: bash
         run: |
-          echo "Cleanup temp directory ${{env.CONTD_CRI_DIR}} created for cri tests"
-          rm -rf ${{env.CONTD_CRI_DIR}}
+          echo "Cleanup temp directory $CONTD_CRI_DIR created for cri tests"
+          rm -rf "$CONTD_CRI_DIR"
+
+      # Paired with "Restore go modules and build cache" near top of job.
+      # Placed here so the cache includes dependencies fetched during the build.
+      - name: Save go modules and build cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            '%LocalAppData%\go-build' # Windows
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}

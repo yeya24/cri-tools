@@ -17,17 +17,16 @@ limitations under the License.
 package common
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	gofilepath "path/filepath"
 	"strconv"
 
-	"github.com/pkg/errors"
-	"gopkg.in/yaml.v3"
+	yaml "sigs.k8s.io/yaml/goyaml.v3"
 )
 
 // Config is the internal representation of the yaml that defines
-// server configuration
+// server configuration.
 type Config struct {
 	RuntimeEndpoint   string
 	ImageEndpoint     string
@@ -35,25 +34,53 @@ type Config struct {
 	Debug             bool
 	PullImageOnCreate bool
 	DisablePullOnRun  bool
-	yamlData          *yaml.Node //YAML representation of config
+	MaxRetries        int
+	yamlData          *yaml.Node // YAML representation of config
 }
+
+const (
+	// RuntimeEndpoint is the YAML key for the runtime endpoint config option.
+	RuntimeEndpoint = "runtime-endpoint"
+
+	// ImageEndpoint is the YAML key for the image endpoint config option.
+	ImageEndpoint = "image-endpoint"
+
+	// Timeout is the YAML key for the timeout config option.
+	Timeout = "timeout"
+
+	// Debug is the YAML key for the debug config option.
+	Debug = "debug"
+
+	// PullImageOnCreate is the YAML key for the pull image on create config option.
+	PullImageOnCreate = "pull-image-on-create"
+
+	// DisablePullOnRun is the YAML key for the disable pull on run config option.
+	DisablePullOnRun = "disable-pull-on-run"
+
+	// MaxRetries is the YAML key for the max retries config option.
+	MaxRetries = "max-retries"
+)
 
 // ReadConfig reads from a file with the given name and returns a config or
 // an error if the file was unable to be parsed.
 func ReadConfig(filepath string) (*Config, error) {
-	data, err := ioutil.ReadFile(filepath)
+	data, err := os.ReadFile(filepath)
 	if err != nil {
 		return nil, err
 	}
-	yamlConfig := yaml.Node{}
-	err = yaml.Unmarshal(data, &yamlConfig)
+
+	yamlConfig := &yaml.Node{}
+
+	err = yaml.Unmarshal(data, yamlConfig)
 	if err != nil {
 		return nil, err
 	}
+
 	config, err := getConfigOptions(yamlConfig)
 	if err != nil {
 		return nil, err
 	}
+
 	return config, err
 }
 
@@ -61,8 +88,11 @@ func ReadConfig(filepath string) (*Config, error) {
 // an error if the file was unable to be written to.
 func WriteConfig(c *Config, filepath string) error {
 	if c == nil {
-		c = new(Config)
-		c.yamlData = new(yaml.Node)
+		c = &Config{}
+	}
+
+	if c.yamlData == nil {
+		c.yamlData = &yaml.Node{}
 	}
 
 	setConfigOptions(c)
@@ -75,76 +105,90 @@ func WriteConfig(c *Config, filepath string) error {
 	if err := os.MkdirAll(gofilepath.Dir(filepath), 0o755); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filepath, data, 0o644)
+
+	return os.WriteFile(filepath, data, 0o600)
 }
 
-// Extracts config options from the yaml data which is loaded from file
-func getConfigOptions(yamlData yaml.Node) (*Config, error) {
-	config := Config{}
-	config.yamlData = &yamlData
+// Extracts config options from the yaml data which is loaded from file.
+func getConfigOptions(yamlData *yaml.Node) (*Config, error) {
+	config := &Config{yamlData: yamlData}
 
-	if yamlData.Content == nil || len(yamlData.Content) == 0 ||
+	if len(yamlData.Content) == 0 ||
 		yamlData.Content[0].Content == nil {
-		return &config, nil
+		return config, nil
 	}
+
 	contentLen := len(yamlData.Content[0].Content)
 
 	// YAML representation contains 2 yaml ScalarNodes per config option.
 	// One is config option name and other is the value of the option
 	// These ScalarNodes help preserve comments associated with
 	// the YAML entry
-	for indx := 0; indx < contentLen-1; {
-		configOption := yamlData.Content[0].Content[indx]
+	for index := 0; index < contentLen-1; {
+		configOption := yamlData.Content[0].Content[index]
 		name := configOption.Value
-		value := yamlData.Content[0].Content[indx+1].Value
+		value := yamlData.Content[0].Content[index+1].Value
+
 		var err error
+
 		switch name {
-		case "runtime-endpoint":
+		case RuntimeEndpoint:
 			config.RuntimeEndpoint = value
-		case "image-endpoint":
+		case ImageEndpoint:
 			config.ImageEndpoint = value
-		case "timeout":
+		case Timeout:
 			config.Timeout, err = strconv.Atoi(value)
 			if err != nil {
-				return nil, errors.Wrapf(err, "parsing config option '%s'", name)
+				return nil, fmt.Errorf("parsing config option '%s': %w", name, err)
 			}
-		case "debug":
+		case Debug:
 			config.Debug, err = strconv.ParseBool(value)
 			if err != nil {
-				return nil, errors.Wrapf(err, "parsing config option '%s'", name)
+				return nil, fmt.Errorf("parsing config option '%s': %w", name, err)
 			}
-		case "pull-image-on-create":
+		case PullImageOnCreate:
 			config.PullImageOnCreate, err = strconv.ParseBool(value)
 			if err != nil {
-				return nil, errors.Wrapf(err, "parsing config option '%s'", name)
+				return nil, fmt.Errorf("parsing config option '%s': %w", name, err)
 			}
-		case "disable-pull-on-run":
+		case DisablePullOnRun:
 			config.DisablePullOnRun, err = strconv.ParseBool(value)
 			if err != nil {
-				return nil, errors.Wrapf(err, "parsing config option '%s'", name)
+				return nil, fmt.Errorf("parsing config option '%s': %w", name, err)
+			}
+		case MaxRetries:
+			config.MaxRetries, err = strconv.Atoi(value)
+			if err != nil {
+				return nil, fmt.Errorf("parsing config option '%s': %w", name, err)
 			}
 		default:
-			return nil, errors.Errorf("Config option '%s' is not valid", name)
+			return nil, fmt.Errorf("Config option '%s' is not valid", name)
 		}
-		indx += 2
+
+		index += 2
 	}
 
-	return &config, nil
+	return config, nil
 }
 
-// Set config options on yaml data for persistece to file
+// Set config options on yaml data for persistece to file.
 func setConfigOptions(config *Config) {
-	setConfigOption("runtime-endpoint", config.RuntimeEndpoint, config.yamlData)
-	setConfigOption("image-endpoint", config.ImageEndpoint, config.yamlData)
-	setConfigOption("timeout", strconv.Itoa(config.Timeout), config.yamlData)
-	setConfigOption("debug", strconv.FormatBool(config.Debug), config.yamlData)
-	setConfigOption("pull-image-on-create", strconv.FormatBool(config.PullImageOnCreate), config.yamlData)
-	setConfigOption("disable-pull-on-run", strconv.FormatBool(config.DisablePullOnRun), config.yamlData)
+	setConfigOption(RuntimeEndpoint, config.RuntimeEndpoint, config.yamlData)
+	setConfigOption(ImageEndpoint, config.ImageEndpoint, config.yamlData)
+	setConfigOption(Timeout, strconv.Itoa(config.Timeout), config.yamlData)
+	setConfigOption(Debug, strconv.FormatBool(config.Debug), config.yamlData)
+	setConfigOption(
+		PullImageOnCreate,
+		strconv.FormatBool(config.PullImageOnCreate),
+		config.yamlData,
+	)
+	setConfigOption(DisablePullOnRun, strconv.FormatBool(config.DisablePullOnRun), config.yamlData)
+	setConfigOption(MaxRetries, strconv.Itoa(config.MaxRetries), config.yamlData)
 }
 
-// Set config option on yaml
+// Set config option on yaml.
 func setConfigOption(configName, configValue string, yamlData *yaml.Node) {
-	if yamlData.Content == nil || len(yamlData.Content) == 0 {
+	if len(yamlData.Content) == 0 {
 		yamlData.Kind = yaml.DocumentNode
 		yamlData.Content = make([]*yaml.Node, 1)
 		yamlData.Content[0] = &yaml.Node{
@@ -152,21 +196,24 @@ func setConfigOption(configName, configValue string, yamlData *yaml.Node) {
 			Tag:  "!!map",
 		}
 	}
-	var contentLen = 0
-	var foundOption = false
+
+	contentLen := 0
+	foundOption := false
+
 	if yamlData.Content[0].Content != nil {
 		contentLen = len(yamlData.Content[0].Content)
 	}
 
 	// Set value on existing config option
-	for indx := 0; indx < contentLen-1; {
-		name := yamlData.Content[0].Content[indx].Value
+	for index := 0; index < contentLen-1; {
+		name := yamlData.Content[0].Content[index].Value
 		if name == configName {
-			yamlData.Content[0].Content[indx+1].Value = configValue
+			// Set the value, even if we have the option defined multiple times.
+			yamlData.Content[0].Content[index+1].Value = configValue
 			foundOption = true
-			break
 		}
-		indx += 2
+
+		index += 2
 	}
 
 	// New config option to set
@@ -175,23 +222,32 @@ func setConfigOption(configName, configValue string, yamlData *yaml.Node) {
 	// These ScalarNodes help preserve comments associated with
 	// the YAML entry
 	if !foundOption {
+		const (
+			tagPrefix = "!!"
+			tagStr    = tagPrefix + "str"
+			tagBool   = tagPrefix + "bool"
+			tagInt    = tagPrefix + "int"
+		)
+
 		name := &yaml.Node{
 			Kind:  yaml.ScalarNode,
 			Value: configName,
-			Tag:   "!!str",
+			Tag:   tagStr,
 		}
+
 		var tagType string
+
 		switch configName {
-		case "timeout":
-			tagType = "!!int"
-		case "debug":
-			tagType = "!!bool"
-		case "pull-image-on-create":
-			tagType = "!!bool"
-		case "disable-pull-on-run":
-			tagType = "!!bool"
+		case Timeout, MaxRetries:
+			tagType = tagInt
+		case Debug:
+			tagType = tagBool
+		case PullImageOnCreate:
+			tagType = tagBool
+		case DisablePullOnRun:
+			tagType = tagBool
 		default:
-			tagType = "!!str"
+			tagType = tagStr
 		}
 
 		value := &yaml.Node{
